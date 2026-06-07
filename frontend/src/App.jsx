@@ -1,0 +1,1028 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Area,
+  CartesianGrid,
+  ComposedChart,
+  Legend,
+  Line,
+  ReferenceLine,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import { api } from "./api";
+
+const tabs = [
+  ["chain", "Option Chain"],
+  ["debit", "Debit Spreads"],
+  ["credit", "Credit Spreads"],
+  ["iron-condor", "Iron Condors"],
+  ["butterfly", "Butterflies"],
+  ["broken-wing-butterfly", "Broken Wings"],
+  ["risk-reversal", "Risk Reversals"],
+  ["straddle", "Straddles"],
+  ["strangle", "Strangles"],
+  ["calendar", "Calendar Spreads"],
+  ["diagonal", "Diagonal Spreads"],
+  ["covered", "Covered Call Proxy"],
+  ["others-1", "Others 1"],
+  ["others-2", "Others 2"],
+  ["report", "AI Trade Report"],
+];
+
+const money = (value) =>
+  value == null
+    ? "—"
+    : new Intl.NumberFormat("en-IN", {
+        style: "currency",
+        currency: "INR",
+        maximumFractionDigits: 0,
+      }).format(value);
+
+const number = (value, digits = 2) =>
+  value == null ? "—" : Number(value).toLocaleString("en-IN", { maximumFractionDigits: digits });
+
+const strategyCopy = {
+  debit: ["Debit Spreads", "Defined-risk directional structures ranked across calls and puts."],
+  credit: ["Credit Spreads", "Bull put and bear call credit spreads ranked by premium, risk and liquidity."],
+  "iron-condor": ["Iron Condors", "Range-bound four-leg structures with defined risk on both sides."],
+  butterfly: ["Butterflies", "Long and short call/put butterflies around liquid strikes."],
+  "broken-wing-butterfly": ["Broken-Wing Butterflies", "Asymmetric butterflies designed to shift risk and reward."],
+  "risk-reversal": ["Risk Reversals", "Bullish and bearish synthetic directional structures with unbounded tail risk."],
+  straddle: ["Straddles", "ATM long and short volatility structures."],
+  strangle: ["Strangles", "OTM long and short volatility structures."],
+  calendar: ["Calendar Spreads", "Same-strike, different-expiry structures evaluated at the near expiry."],
+  diagonal: ["Diagonal Spreads", "Different-strike time spreads balancing direction, decay and volatility."],
+};
+
+const strategyGuidance = {
+  debit: { suitable: "Use when you expect a directional move and want the entry debit to define maximum loss.", iv: "Low to normal", bias: "Bullish calls / bearish puts", risk: "Defined", expiry: "Single expiry" },
+  credit: { suitable: "Use when you expect price to remain beyond the short strike and want time decay working in your favor.", iv: "Normal to elevated", bias: "Bullish puts / bearish calls", risk: "Defined", expiry: "Single expiry" },
+  "iron-condor": { suitable: "Use when you expect NIFTY to remain inside a range and option premium is rich enough to justify the credit.", iv: "Elevated, preferably falling", bias: "Range-bound", risk: "Defined", expiry: "Single expiry" },
+  butterfly: { suitable: "Use when you expect NIFTY to finish near a target strike or want a low-cost volatility structure.", iv: "Low to normal for long", bias: "Targeted / neutral", risk: "Defined", expiry: "Single expiry" },
+  "broken-wing-butterfly": { suitable: "Use when you have a directional target but want asymmetric cost and risk versus a standard butterfly.", iv: "Normal", bias: "Directional neutral", risk: "Inspect each candidate", expiry: "Single expiry" },
+  "risk-reversal": { suitable: "Use for a strong directional view only when you understand the substantial naked-option tail risk.", iv: "Skew-dependent", bias: "Strong bullish or bearish", risk: "Unbounded tail", expiry: "Single expiry" },
+  straddle: { suitable: "Long straddles suit a large move from ATM; short straddles suit contraction but carry unlimited tail risk.", iv: "Long: low; short: high", bias: "Volatility", risk: "Varies by side", expiry: "Single expiry" },
+  strangle: { suitable: "Long strangles suit a large move beyond OTM strikes; short strangles suit range conditions with unlimited tail risk.", iv: "Long: low; short: high", bias: "Volatility", risk: "Varies by side", expiry: "Single expiry" },
+  calendar: { suitable: "Use when you expect price near the shared strike at near expiry and want time-decay and IV-term exposure.", iv: "Stable or rising far IV", bias: "Neutral / directional", risk: "Modeled debit", expiry: "Near and far" },
+  diagonal: { suitable: "Use for a directional view combined with time-decay and volatility-term-structure exposure.", iv: "Stable term structure", bias: "Directional", risk: "Modeled", expiry: "Near and far" },
+  covered: { suitable: "Use when holding NIFTYBEES with a neutral-to-moderately bullish view and accepting capped upside for premium.", iv: "Normal to elevated", bias: "Neutral / moderately bullish", risk: "ETF-option proxy", expiry: "Single option expiry" },
+  report: { suitable: "Use after selecting and analyzing a candidate. The report compares it with supplied trend, macro and event context.", iv: "Selected strategy", bias: "Selected strategy", risk: "Educational analysis", expiry: "Selected strategy" },
+};
+
+const otherGroups = {
+  "others-1": [
+    { id: "jade-lizard", name: "Jade Lizard", suitable: "Neutral to moderately bullish markets with elevated IV.", iv: "Elevated", bias: "Neutral / bullish", risk: "Unbounded downside", expiry: "Single expiry" },
+    { id: "box-spread", name: "Box Spread", suitable: "Synthetic financing or clear pricing discrepancies after all execution costs.", iv: "Low sensitivity", bias: "Market neutral", risk: "Defined", expiry: "Single expiry" },
+    { id: "seagull", name: "Seagull", suitable: "A directional view where reduced premium is worth capped reward and one open tail.", iv: "Normal to elevated", bias: "Bullish or bearish", risk: "One unbounded tail", expiry: "Single expiry" },
+    { id: "christmas-tree", name: "Christmas Tree", suitable: "A controlled move toward a target strike rather than an unlimited trend.", iv: "Normal", bias: "Directional", risk: "Defined", expiry: "Single expiry" },
+    { id: "guts", name: "Guts", suitable: "A large move or volatility contraction, with higher premium than a comparable straddle.", iv: "Long: low; short: high", bias: "Volatility", risk: "Varies by side", expiry: "Single expiry" },
+  ],
+  "others-2": [
+    { id: "fence", name: "Fence", suitable: "Protecting NIFTYBEES while reducing hedge cost and accepting capped upside/reduced tail protection.", iv: "Normal to elevated", bias: "Protective", risk: "Proxy hedge", expiry: "Single expiry" },
+    { id: "collar", name: "Collar", suitable: "Limiting downside on NIFTYBEES while accepting a cap on upside.", iv: "Normal to elevated", bias: "Protective / bullish", risk: "Proxy hedge", expiry: "Single expiry" },
+    { id: "poor-mans-covered-call", name: "Poor Man's Covered Call", suitable: "A moderately bullish outlook using a long-dated ITM call and near-dated call income.", iv: "Stable term structure", bias: "Moderately bullish", risk: "Modeled / defined debit", expiry: "Near and far" },
+    { id: "strip", name: "Strip", suitable: "Expecting a large move with stronger bearish conviction.", iv: "Prefer lower IV", bias: "Volatility / bearish", risk: "Defined debit", expiry: "Single expiry" },
+    { id: "strap", name: "Strap", suitable: "Expecting a large move with stronger bullish conviction.", iv: "Prefer lower IV", bias: "Volatility / bullish", risk: "Defined debit", expiry: "Single expiry" },
+  ],
+};
+
+function metricMoney(value, bounded = true) {
+  if (bounded === false && value == null) return "Unlimited";
+  return money(value);
+}
+
+function StatusBar({ chain, loading, onRefresh }) {
+  return (
+    <div className="status-bar">
+      <div>
+        <span className={`status-dot ${chain?.stale ? "warn" : ""}`} />
+        {loading ? "Updating market data…" : chain ? `NIFTY ${number(chain.underlying_value)}` : "Connecting…"}
+      </div>
+      <div className="status-meta">
+        {chain?.timestamp && <span>As of {chain.timestamp}</span>}
+        <button className="button ghost" onClick={onRefresh} disabled={loading}>
+          Refresh
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function Metric({ label, value, tone = "" }) {
+  return (
+    <div className={`metric ${tone}`}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function ChainTable({ chain, search, setSearch, range, setRange }) {
+  const rows = useMemo(() => {
+    if (!chain) return [];
+    return chain.rows.filter((row) => {
+      const matchesSearch = !search || String(row.strike).includes(search);
+      const matchesRange =
+        range === "all" ||
+        Math.abs(row.strike - chain.underlying_value) <= Number(range);
+      return matchesSearch && matchesRange;
+    });
+  }, [chain, search, range]);
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <div>
+          <p className="eyebrow">Live derivatives board</p>
+          <h2>Option Chain</h2>
+        </div>
+        <div className="filters">
+          <input
+            aria-label="Search strike"
+            placeholder="Search strike"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+          />
+          <select aria-label="Strike range" value={range} onChange={(event) => setRange(event.target.value)}>
+            <option value="500">± 500 points</option>
+            <option value="1000">± 1,000 points</option>
+            <option value="all">All strikes</option>
+          </select>
+        </div>
+      </div>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr className="group-head">
+              <th colSpan="7" className="ce-head">CALLS</th>
+              <th>STRIKE</th>
+              <th colSpan="7" className="pe-head">PUTS</th>
+            </tr>
+            <tr>
+              <th>OI</th><th>OI Δ</th><th>Vol</th><th>IV</th><th>Bid</th><th>LTP</th><th>Ask</th>
+              <th>Price</th>
+              <th>Bid</th><th>LTP</th><th>Ask</th><th>IV</th><th>Vol</th><th>OI Δ</th><th>OI</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => {
+              const atm = Math.abs(row.strike - chain.underlying_value) < 25;
+              return (
+                <tr key={row.strike} className={atm ? "atm" : ""}>
+                  <td>{number(row.ce?.open_interest, 0)}</td>
+                  <td className={row.ce?.change_in_oi >= 0 ? "positive" : "negative"}>{number(row.ce?.change_in_oi, 0)}</td>
+                  <td>{number(row.ce?.volume, 0)}</td><td>{number(row.ce?.implied_volatility)}</td>
+                  <td>{number(row.ce?.bid)}</td><td className="ltp">{number(row.ce?.last_price)}</td><td>{number(row.ce?.ask)}</td>
+                  <th>{number(row.strike, 0)}</th>
+                  <td>{number(row.pe?.bid)}</td><td className="ltp">{number(row.pe?.last_price)}</td><td>{number(row.pe?.ask)}</td>
+                  <td>{number(row.pe?.implied_volatility)}</td><td>{number(row.pe?.volume, 0)}</td>
+                  <td className={row.pe?.change_in_oi >= 0 ? "positive" : "negative"}>{number(row.pe?.change_in_oi, 0)}</td>
+                  <td>{number(row.pe?.open_interest, 0)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      {!rows.length && <div className="empty">No strikes match the current filter.</div>}
+      <SiteNavigationGuide />
+    </section>
+  );
+}
+
+function SuitabilityGuide({ title, guidance }) {
+  if (!guidance) return null;
+  return (
+    <article className="suitability-card">
+      <div><p className="eyebrow">When it is suitable</p><h3>{title}</h3><p>{guidance.suitable}</p></div>
+      <dl>
+        <div><dt>IV environment</dt><dd>{guidance.iv}</dd></div>
+        <div><dt>Directional bias</dt><dd>{guidance.bias}</dd></div>
+        <div><dt>Risk profile</dt><dd>{guidance.risk}</dd></div>
+        <div><dt>Expiry</dt><dd>{guidance.expiry}</dd></div>
+      </dl>
+    </article>
+  );
+}
+
+function SiteNavigationGuide() {
+  return (
+    <aside className="navigation-guide">
+      <p className="eyebrow">How to navigate the site</p>
+      <h3>From chain to trade analysis</h3>
+      <ol>
+        <li>Select an expiry and inspect LTP, liquidity, OI, volume and IV.</li>
+        <li>Open a strategy tab matching your outlook and read its suitability guidance.</li>
+        <li>Select <b>Analyse</b> to inspect payoff, breakevens, date and IV scenarios.</li>
+        <li>Add verified macro/events context, then generate the educational trade report.</li>
+      </ol>
+    </aside>
+  );
+}
+
+function PayoffMini({ candidate, spot, lotSize }) {
+  const values = [];
+  for (let i = -4; i <= 4; i += 1) {
+    const price = spot + i * 100;
+    let pnl = 0;
+    candidate.legs.forEach((leg) => {
+      const intrinsic =
+        leg.option_type === "CE"
+          ? Math.max(0, price - leg.strike)
+          : Math.max(0, leg.strike - price);
+      pnl += (leg.action === "BUY" ? intrinsic - leg.price : leg.price - intrinsic) * lotSize * (leg.quantity || 1);
+    });
+    values.push(pnl);
+  }
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const points = values
+    .map((value, index) => `${index * 25},${52 - ((value - min) / Math.max(max - min, 1)) * 44}`)
+    .join(" ");
+  return (
+    <svg className="payoff" viewBox="0 0 200 58" role="img" aria-label="Indicative payoff shape">
+      <line x1="0" x2="200" y1="29" y2="29" />
+      <polyline points={points} />
+    </svg>
+  );
+}
+
+function CandidateCard({ candidate, spot, lotSize, selected, onSelect }) {
+  const modeled = candidate.metric_mode === "modeled";
+  return (
+    <article className={`candidate ${selected ? "selected" : ""}`}>
+      <div className="candidate-top">
+        <div>
+          <span className="score">Score {number(candidate.score, 0)}</span>
+          <h3>{candidate.strategy}</h3>
+          <p>{candidate.outlook}</p>
+        </div>
+        <button className="button small" onClick={() => onSelect(candidate)}>
+          {selected ? "Selected" : "Analyse"}
+        </button>
+      </div>
+      <div className="legs">
+        {candidate.legs.map((leg, index) => (
+          <div className={`leg ${leg.action.toLowerCase()}`} key={`${leg.action}-${leg.strike}-${index}`}>
+            <b>{leg.action}</b> {leg.quantity > 1 ? `${leg.quantity}x ` : ""}{leg.option_type} {number(leg.strike, 0)}
+            <span>{leg.expiry} · {number(leg.price)}</span>
+          </div>
+        ))}
+      </div>
+      <div className="metrics-grid">
+        <Metric label="Net debit" value={money(candidate.net_debit)} />
+        <Metric label="Net credit" value={money(candidate.net_credit)} />
+        <Metric label={modeled ? "Estimated peak profit" : "Max profit"} value={modeled ? money(candidate.estimated_peak_profit) : metricMoney(candidate.max_profit, candidate.metadata?.bounded_profit)} tone="good" />
+        <Metric label={modeled ? "Modeled worst loss" : "Max loss"} value={modeled ? money(candidate.modeled_worst_loss) : metricMoney(candidate.max_loss, candidate.metadata?.bounded_loss)} tone="risk" />
+        <Metric label={modeled ? "Modeled return / risk" : "Return / risk"} value={(modeled ? candidate.modeled_return_risk : candidate.return_on_risk) == null ? "—" : `${number(modeled ? candidate.modeled_return_risk : candidate.return_on_risk)}%`} />
+        <Metric label="Liquidity" value={`${number(candidate.liquidity_score, 0)}/100`} />
+      </div>
+      {candidate.metric_mode === "fixed" && <PayoffMini candidate={candidate} spot={spot} lotSize={lotSize} />}
+      {(modeled ? candidate.estimated_breakevens : candidate.breakevens)?.length > 0 && <p className="breakeven">{modeled ? "Estimated breakevens" : "Breakeven"}: {(modeled ? candidate.estimated_breakevens : candidate.breakevens).map(number).join(", ")}</p>}
+      {candidate.notes?.map((note) => <p className="note" key={note}>{note}</p>)}
+    </article>
+  );
+}
+
+function AnalysisTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+  return (
+    <div className="chart-tooltip">
+      <strong>NIFTY {number(label, 0)}</strong>
+      {payload.filter((item) => ["today_pnl", "evaluation_pnl"].includes(item.dataKey)).map((item) => (
+        <div key={item.dataKey} style={{ color: item.color }}>
+          {item.name}: {money(item.value)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AnalysisModal({ candidate, chain, open, onClose, report, setReport, marketContext, setMarketContext }) {
+  const [analysis, setAnalysis] = useState(null);
+  const [evaluationDays, setEvaluationDays] = useState(3650);
+  const [ivShift, setIvShift] = useState(0);
+  const [priceRange, setPriceRange] = useState(10);
+  const [loading, setLoading] = useState(false);
+  const [reportLoading, setReportLoading] = useState(false);
+  const [error, setError] = useState("");
+  const closeRef = useRef(null);
+  const previousFocus = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    previousFocus.current = document.activeElement;
+    document.body.style.overflow = "hidden";
+    closeRef.current?.focus();
+    const handleKey = (event) => {
+      if (event.key === "Escape") onClose();
+      if (event.key === "Tab") {
+        const focusable = document.querySelectorAll(
+          ".analysis-modal button, .analysis-modal input, .analysis-modal select",
+        );
+        if (!focusable.length) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    };
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("keydown", handleKey);
+      document.body.style.overflow = "";
+      previousFocus.current?.focus?.();
+    };
+  }, [open, onClose]);
+
+  useEffect(() => {
+    if (!open) return;
+    setAnalysis(null);
+    setEvaluationDays(3650);
+    setIvShift(0);
+    setPriceRange(10);
+  }, [candidate?.id, open]);
+
+  useEffect(() => {
+    if (!open || !candidate || !chain) return;
+    const timer = setTimeout(async () => {
+      setLoading(true);
+      setError("");
+      try {
+        const result = await api.analysis({
+          candidate,
+          underlying_value: chain.underlying_value,
+          lot_size: chain.lot_size,
+          chain_timestamp: chain.timestamp,
+          evaluation_days: evaluationDays,
+          iv_shift: ivShift,
+          price_range_pct: priceRange,
+        });
+        setAnalysis(result);
+        if (evaluationDays > result.max_evaluation_days) {
+          setEvaluationDays(result.max_evaluation_days);
+        }
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        setLoading(false);
+      }
+    }, 180);
+    return () => clearTimeout(timer);
+  }, [open, candidate, chain, evaluationDays, ivShift, priceRange]);
+
+  if (!open || !candidate) return null;
+  const chartData = (analysis?.points || []).map((point) => ({
+    ...point,
+    profit: Math.max(0, point.evaluation_pnl),
+    loss: Math.min(0, point.evaluation_pnl),
+  }));
+  const reset = () => {
+    setEvaluationDays(analysis?.max_evaluation_days ?? 3650);
+    setIvShift(0);
+    setPriceRange(10);
+  };
+  const generateReport = async () => {
+    setReportLoading(true);
+    setError("");
+    try {
+      setReport(await api.report({
+        candidate,
+        chain_timestamp: chain.timestamp,
+        underlying_value: chain.underlying_value,
+        assumptions: [
+          `NIFTY lot size ${chain.lot_size}`,
+          "Quotes may be delayed or stale",
+          "Educational analysis only",
+        ],
+        analysis,
+        market_context: marketContext,
+      }));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setReportLoading(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <section className="analysis-modal" role="dialog" aria-modal="true" aria-labelledby="analysis-title">
+        <header className="modal-head">
+          <div>
+            <p className="eyebrow">Interactive strategy analysis</p>
+            <h2 id="analysis-title">{candidate.strategy}</h2>
+            <p>{candidate.outlook} · Score {number(candidate.score, 0)} · Liquidity {number(candidate.liquidity_score, 0)}/100</p>
+          </div>
+          <button ref={closeRef} className="modal-close" onClick={onClose} aria-label="Close analysis">×</button>
+        </header>
+
+        <div className="analysis-layout">
+          <aside className="analysis-sidebar">
+            <div className="legs modal-legs">
+              {candidate.legs.map((leg) => (
+                <div className={`leg ${leg.action.toLowerCase()}`} key={`${leg.action}-${leg.strike}-${leg.expiry}`}>
+                  <b>{leg.action}</b> {leg.quantity > 1 ? `${leg.quantity}x ` : ""}{leg.option_type} {number(leg.strike, 0)}
+                  <span>{leg.expiry} · ₹{number(leg.price)} · IV {number(leg.implied_volatility)}%</span>
+                </div>
+              ))}
+            </div>
+            <div className="analysis-metrics">
+              <Metric label="Net debit" value={money(analysis?.net_debit)} />
+              <Metric label="Net credit" value={money(analysis?.net_credit)} />
+              <Metric label={candidate.metric_mode === "modeled" ? "Estimated peak profit" : "Max profit"} value={metricMoney(candidate.metric_mode === "modeled" ? analysis?.estimated_peak_profit : candidate.max_profit, candidate.metadata?.bounded_profit)} tone="good" />
+              <Metric label={candidate.metric_mode === "modeled" ? "Modeled worst loss" : "Max loss"} value={metricMoney(candidate.metric_mode === "modeled" ? analysis?.modeled_worst_loss : candidate.max_loss, candidate.metadata?.bounded_loss)} tone="risk" />
+              <Metric label="Modeled return / risk" value={analysis?.modeled_return_risk == null ? "—" : `${number(analysis.modeled_return_risk)}%`} />
+              <Metric label="Breakevens" value={analysis?.estimated_breakevens?.length ? analysis.estimated_breakevens.map((value) => number(value, 0)).join(" – ") : "Outside range"} />
+            </div>
+            <div className="basis-box">
+              <p className="eyebrow">Calculation basis</p>
+              <span>Lot size <b>{candidate.metadata?.lot_size || chain.lot_size}</b></span>
+              <span>Premium basis <b>{candidate.metadata?.premium_basis || "LTP"}</b></span>
+              <span>Payoff type <b>{candidate.metadata?.payoff_type === "expiry" ? "Expiry payoff" : "Modeled payoff"}</b></span>
+            </div>
+            <button className="button report-button" onClick={generateReport} disabled={reportLoading || loading}>
+              {reportLoading ? "Generating…" : "Generate Trade Report"}
+            </button>
+          </aside>
+
+          <div className="analysis-main">
+            <div className="analysis-controls">
+              <label>Evaluation date <span>{analysis?.evaluation_label || "—"}</span>
+                <input type="range" min="0" max={analysis?.max_evaluation_days || 0} value={Math.min(evaluationDays, analysis?.max_evaluation_days || 0)} onChange={(event) => setEvaluationDays(Number(event.target.value))} />
+              </label>
+              <label>IV shift <span>{ivShift > 0 ? "+" : ""}{ivShift}%</span>
+                <input type="range" min="-10" max="10" step="1" value={ivShift} onChange={(event) => setIvShift(Number(event.target.value))} />
+              </label>
+              <label>Price range
+                <select value={priceRange} onChange={(event) => setPriceRange(Number(event.target.value))}>
+                  <option value="5">± 5%</option><option value="10">± 10%</option><option value="15">± 15%</option><option value="20">± 20%</option>
+                </select>
+              </label>
+              <button className="button ghost" onClick={reset}>Reset</button>
+            </div>
+
+            <div className="chart-shell" aria-label="Interactive profit and loss chart">
+              {loading && <div className="chart-loading">Repricing strategy…</div>}
+              <ResponsiveContainer width="100%" height={390}>
+                <ComposedChart data={chartData} margin={{ top: 20, right: 24, bottom: 18, left: 18 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#dedbd2" />
+                  <XAxis dataKey="underlying_price" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(value) => number(value, 0)} />
+                  <YAxis tickFormatter={(value) => `₹${number(value, 0)}`} width={82} />
+                  <Tooltip content={<AnalysisTooltip />} />
+                  <Legend />
+                  <ReferenceLine y={0} stroke="#798092" />
+                  <ReferenceLine x={chain.underlying_value} stroke="#c69a4b" strokeDasharray="5 4" label="Spot" />
+                  {analysis?.estimated_breakevens?.map((value) => <ReferenceLine key={value} x={value} stroke="#7f8ba0" strokeDasharray="2 4" />)}
+                  <Area type="monotone" dataKey="profit" name="Profit zone" stroke="none" fill="#50a98b" fillOpacity={0.16} />
+                  <Area type="monotone" dataKey="loss" name="Loss zone" stroke="none" fill="#d46962" fillOpacity={0.14} />
+                  <Line type="monotone" dataKey="today_pnl" name="Today P&L" stroke="#2b62be" strokeWidth={2} strokeDasharray="6 4" dot={false} />
+                  <Line type="monotone" dataKey="evaluation_pnl" name={`${analysis?.evaluation_label || "Evaluation"} P&L`} stroke="#0b8a65" strokeWidth={3} dot={false} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+            {error && <div className="alert">{error}</div>}
+            <div className="analysis-assumptions">
+              {(analysis?.assumptions || candidate.pricing_assumptions || []).map((item) => <p key={item}>{item}</p>)}
+            </div>
+            <MarketContextEditor context={marketContext} setContext={setMarketContext} />
+            {report && (
+              <article className="inline-report">
+                <div className="report-title-row">
+                  <div><p className="eyebrow">Trade report</p><h3>{report.title}</h3></div>
+                  <span className="source-badge">{report.generated_by === "gemini" ? "Gemini" : "Rules fallback"}</span>
+                </div>
+                <p><b>Setup:</b> {report.setup}</p>
+                <p><b>Rationale:</b> {report.rationale}</p>
+                <p><b>Payoff:</b> {report.payoff}</p>
+                <p><b>Trend:</b> Short term {report.short_term_trend}; medium term {report.medium_term_trend}. {report.momentum_and_volatility}</p>
+                <p><b>Suitability:</b> {report.strategy_suitability}</p>
+                <p><b>Trade recommendation:</b> {report.trade_recommendation}</p>
+                <div className="report-columns">
+                  <div><h4>Favorable</h4><ul>{report.favorable_scenarios.map((item) => <li key={item}>{item}</li>)}</ul></div>
+                  <div><h4>Risks</h4><ul>{report.risks.map((item) => <li key={item}>{item}</li>)}</ul></div>
+                </div>
+                <div className="report-columns">
+                  <div><h4>Global macro</h4><ul>{report.global_macro_context.map((item) => <li key={item}>{item}</li>)}</ul></div>
+                  <div><h4>Upcoming events</h4><ul>{report.upcoming_events.map((item) => <li key={item}>{item}</li>)}</ul></div>
+                </div>
+                <div className="disclaimer">{report.disclaimer}</div>
+              </article>
+            )}
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function StrategyPanel({ title, description, guidance, candidates, loading, error, selected, setSelected, spot, lotSize, showScore = true }) {
+  return (
+    <section>
+      <div className="section-intro">
+        <p className="eyebrow">Balanced opportunity ranking</p>
+        <h2>{title}</h2>
+        <p>{description}</p>
+      </div>
+      <SuitabilityGuide title={title} guidance={guidance} />
+      {loading && <div className="loading-card">Scanning liquid strikes and calculating payoff…</div>}
+      {error && <div className="alert">{error}</div>}
+      {!loading && !error && !candidates.length && <div className="empty">No valid candidates found for these expiries.</div>}
+      <div className="candidate-grid">
+        {candidates.map((candidate) => (
+          <CandidateCard
+            key={candidate.id}
+            candidate={candidate}
+            spot={spot}
+            lotSize={lotSize}
+            selected={selected?.id === candidate.id}
+            onSelect={setSelected}
+          />
+        ))}
+      </div>
+      {showScore && <ScoreExplanation />}
+    </section>
+  );
+}
+
+function ScoreExplanation() {
+  return (
+    <aside className="score-explanation">
+      <p className="eyebrow">How the score works</p>
+      <h3>Balanced opportunity score</h3>
+      <p>
+        The 0–100 score blends executable liquidity, bid/ask quality, reward versus
+        risk, breakeven distance, OI and volume, sensible strike spacing, and whether
+        risk is clearly defined. Crossed quotes are rejected; weak liquidity,
+        unrealistic spacing, proxy mismatch, and unbounded exposure reduce the rank.
+        It is a comparison tool, not a probability of profit or an entry signal.
+      </p>
+    </aside>
+  );
+}
+
+function PortfolioInputs({ values, setValues, onScan, loading }) {
+  return (
+    <form className="portfolio-inputs" onSubmit={(event) => { event.preventDefault(); onScan(); }}>
+      {[
+        ["units", "NIFTYBEES units", 1],
+        ["average_cost", "Average cost", 0.01],
+        ["current_price", "Current price", 0.01],
+      ].map(([key, label, step]) => (
+        <label key={key}>{label}
+          <input type="number" min={step} step={step} value={values[key]} onChange={(event) => setValues({ ...values, [key]: Number(event.target.value) })} />
+        </label>
+      ))}
+      <button className="button" disabled={loading}>Scan position</button>
+      <p>Session-only values. NIFTYBEES and NIFTY options retain tracking, multiplier, basis and cash-settlement risk.</p>
+    </form>
+  );
+}
+
+function OtherStrategiesPanel({
+  group,
+  selectedStrategy,
+  setSelectedStrategy,
+  candidates,
+  loading,
+  error,
+  selected,
+  setSelected,
+  spot,
+  lotSize,
+  portfolio,
+  setPortfolio,
+  scanPortfolio,
+}) {
+  const strategies = otherGroups[group];
+  const active = strategies.find((item) => item.id === selectedStrategy) || strategies[0];
+  return (
+    <section>
+      <div className="section-intro wide">
+        <p className="eyebrow">{group === "others-1" ? "Income and asymmetric structures" : "Portfolio and directional structures"}</p>
+        <h2>{group === "others-1" ? "Others 1" : "Others 2"}</h2>
+        <p>Select a strategy to see when it is suitable before reviewing ranked candidates.</p>
+      </div>
+      <div className="strategy-selector" role="tablist" aria-label={`${group} strategies`}>
+        {strategies.map((item) => (
+          <button key={item.id} role="tab" aria-selected={item.id === selectedStrategy} className={item.id === selectedStrategy ? "active" : ""} onClick={() => setSelectedStrategy(item.id)}>
+            {item.name}
+          </button>
+        ))}
+      </div>
+      <SuitabilityGuide title={active.name} guidance={active} />
+      {["fence", "collar"].includes(selectedStrategy) && (
+        <PortfolioInputs values={portfolio} setValues={setPortfolio} onScan={scanPortfolio} loading={loading} />
+      )}
+      <StrategyPanel title={`${active.name} Candidates`} description={`Top candidates ranked for the selected ${active.name} structure.`} candidates={candidates} loading={loading} error={error} selected={selected} setSelected={setSelected} spot={spot} lotSize={lotSize} showScore={false} />
+      <ScoreExplanation />
+    </section>
+  );
+}
+
+function MarketContextEditor({ context, setContext }) {
+  const updateList = (key, value) => setContext({
+    ...context,
+    [key]: value.split("\n").map((item) => item.trim()).filter(Boolean),
+  });
+  return (
+    <section className="market-context">
+      <div className="market-context-head">
+        <div><p className="eyebrow">Grounded market context</p><h3>NIFTY trend, macro and events</h3></div>
+        <span className={`context-status ${context?.stale ? "stale" : ""}`}>{context?.stale ? "Trend unavailable / stale" : "Trend data current"}</span>
+      </div>
+      <div className="trend-grid">
+        <span>Short term <b>{context?.short_term_trend || "Unavailable"}</b></span>
+        <span>Medium term <b>{context?.medium_term_trend || "Unavailable"}</b></span>
+        <span>Momentum <b>{context?.momentum || "Unavailable"}</b></span>
+        <span>Volatility <b>{context?.volatility_regime || "Unavailable"}</b></span>
+      </div>
+      <div className="context-inputs">
+        <label>Verified global macro context
+          <textarea rows="3" value={(context?.global_macro_context || []).join("\n")} onChange={(event) => updateList("global_macro_context", event.target.value)} placeholder="One verified item per line" />
+        </label>
+        <label>Expected upcoming events
+          <textarea rows="3" value={(context?.upcoming_events || []).join("\n")} onChange={(event) => updateList("upcoming_events", event.target.value)} placeholder="One dated event per line" />
+        </label>
+        <label>Macro and event sources
+          <textarea rows="3" value={(context?.sources || []).join("\n")} onChange={(event) => updateList("sources", event.target.value)} placeholder="One attributable source per line" />
+        </label>
+      </div>
+      <p className="context-note">Only the timestamped trend metrics and text entered here are sent with the trade calculations. Gemini is instructed not to invent current events.</p>
+    </section>
+  );
+}
+
+function CoveredCallForm({ expiry, onResults, setLoading, setError }) {
+  const [form, setForm] = useState({ units: 5000, average_cost: 250, current_price: 285 });
+  const submit = async (event) => {
+    event.preventDefault();
+    setLoading(true);
+    setError("");
+    try {
+      onResults(await api.coveredCall({ expiry, ...form }));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+  return (
+    <form className="covered-form panel" onSubmit={submit}>
+      <div>
+        <p className="eyebrow">Your ETF position</p>
+        <h2>NIFTYBEES Covered-Call Proxy</h2>
+        <p>Enter your position to compare its value with one cash-settled NIFTY option lot.</p>
+      </div>
+      {["units", "average_cost", "current_price"].map((field) => (
+        <label key={field}>
+          {field.replace("_", " ")}
+          <input
+            type="number"
+            min="0.01"
+            step={field === "units" ? "1" : "0.01"}
+            value={form[field]}
+            onChange={(event) => setForm({ ...form, [field]: Number(event.target.value) })}
+          />
+        </label>
+      ))}
+      <button className="button" type="submit">Find call overwrites</button>
+      <p className="note">This is an exposure proxy, not a fully covered position. Tracking, basis and settlement risks remain.</p>
+    </form>
+  );
+}
+
+function ReportPanel({ selected, chain, report, setReport, marketContext, setMarketContext }) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const generate = async () => {
+    if (!selected || !chain) return;
+    setLoading(true);
+    setError("");
+    try {
+      setReport(await api.report({
+        candidate: selected,
+        chain_timestamp: chain.timestamp,
+        underlying_value: chain.underlying_value,
+        assumptions: [
+          `NIFTY lot size ${chain.lot_size}`,
+          "Quotes may be delayed or stale",
+          "Educational analysis only",
+        ],
+        market_context: marketContext,
+      }));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+  if (!selected) {
+    return (
+      <section>
+        <SuitabilityGuide title="AI Trade Report" guidance={strategyGuidance.report} />
+        <div className="empty report-empty">Select “Analyse” on a strategy candidate to prepare an AI trade report.</div>
+        <ScoreExplanation />
+      </section>
+    );
+  }
+  return (
+    <section>
+      <SuitabilityGuide title="AI Trade Report" guidance={strategyGuidance.report} />
+      <div className="report-layout">
+        <aside className="panel report-source">
+        <p className="eyebrow">Selected setup</p>
+        <h2>{selected.strategy}</h2>
+        {selected.legs.map((leg) => <p key={`${leg.action}-${leg.strike}`}>{leg.action} {leg.quantity > 1 ? `${leg.quantity}x ` : ""}{leg.option_type} {leg.strike} · {leg.expiry}</p>)}
+        <button className="button" onClick={generate} disabled={loading}>
+          {loading ? "Generating…" : "Generate AI report"}
+        </button>
+        {error && <div className="alert">{error}</div>}
+        </aside>
+        <article className="panel report">
+        {!report ? <p className="muted">The report will use only this trade’s calculated metrics and chain timestamp.</p> : (
+          <>
+            <p className="eyebrow">AI-assisted risk review</p>
+            <span className="source-badge">{report.generated_by === "gemini" ? "Gemini" : "Rules fallback"}</span>
+            <h1>{report.title}</h1>
+            {[ 
+              ["Setup", report.setup],
+              ["Rationale", report.rationale],
+              ["Payoff", report.payoff],
+              ["Short-term NIFTY trend", report.short_term_trend],
+              ["Medium-term NIFTY trend", report.medium_term_trend],
+              ["Momentum and volatility", report.momentum_and_volatility],
+              ["Strategy suitability", report.strategy_suitability],
+              ["Trade recommendation", report.trade_recommendation],
+            ].map(([heading, text]) => <section key={heading}><h3>{heading}</h3><p>{text}</p></section>)}
+            {[
+              ["Breakevens", report.breakevens],
+              ["Favorable scenarios", report.favorable_scenarios],
+              ["Adverse scenarios", report.adverse_scenarios],
+              ["Liquidity concerns", report.liquidity_concerns],
+              ["Exit considerations", report.exit_considerations],
+              ["Risks", report.risks],
+              ["Assumptions", report.assumptions],
+              ["Global macro context", report.global_macro_context],
+              ["Upcoming events", report.upcoming_events],
+              ["Entry conditions", report.entry_conditions],
+              ["Adjustment conditions", report.adjustment_conditions],
+              ["Position sizing cautions", report.position_sizing_cautions],
+              ["Data timestamps", report.data_timestamps],
+              ["Sources", report.sources],
+            ].map(([heading, items]) => <section key={heading}><h3>{heading}</h3><ul>{items.map((item) => <li key={item}>{item}</li>)}</ul></section>)}
+            <p><b>Confidence:</b> {report.confidence}</p>
+            <div className="disclaimer">{report.disclaimer}</div>
+          </>
+        )}
+        </article>
+        <MarketContextEditor context={marketContext} setContext={setMarketContext} />
+      </div>
+      <ScoreExplanation />
+    </section>
+  );
+}
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState("chain");
+  const [expiries, setExpiries] = useState([]);
+  const [expiry, setExpiry] = useState("");
+  const [farExpiry, setFarExpiry] = useState("");
+  const [chain, setChain] = useState(null);
+  const [strategyData, setStrategyData] = useState({ candidates: [] });
+  const [selected, setSelected] = useState(null);
+  const [report, setReport] = useState(null);
+  const [analysisOpen, setAnalysisOpen] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [strategyLoading, setStrategyLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [strategyError, setStrategyError] = useState("");
+  const [search, setSearch] = useState("");
+  const [range, setRange] = useState("500");
+  const [otherSelection, setOtherSelection] = useState({
+    "others-1": "jade-lizard",
+    "others-2": "fence",
+  });
+  const [portfolio, setPortfolio] = useState({ units: 5000, average_cost: 250, current_price: 285 });
+  const [marketContext, setMarketContext] = useState({
+    short_term_trend: "Unavailable",
+    medium_term_trend: "Unavailable",
+    momentum: "Unavailable",
+    volatility_regime: "Unavailable",
+    global_macro_context: [],
+    upcoming_events: [],
+    sources: [],
+    stale: true,
+  });
+
+  const loadChain = async (selectedExpiry, refresh = false) => {
+    if (!selectedExpiry) return;
+    setLoading(true);
+    setError("");
+    try {
+      setChain(await api.chain(selectedExpiry, refresh));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const data = await api.expiries();
+        setExpiries(data.expiries);
+        setExpiry(data.expiries[0]);
+        setFarExpiry(data.expiries[1] || "");
+      } catch (err) {
+        setError(err.message);
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    api.marketContext()
+      .then(setMarketContext)
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    loadChain(expiry);
+  }, [expiry]);
+
+  useEffect(() => {
+    const groupedStrategy = otherGroups[activeTab] ? otherSelection[activeTab] : null;
+    const strategyId = groupedStrategy || activeTab;
+    if ((!Object.keys(strategyCopy).includes(activeTab) && !groupedStrategy) || !expiry) return;
+    if (["fence", "collar"].includes(strategyId)) {
+      (async () => {
+        setStrategyLoading(true);
+        setStrategyError("");
+        try {
+          setStrategyData(await api.portfolioStrategy({
+            expiry,
+            strategy: strategyId,
+            ...portfolio,
+            limit: 10,
+          }));
+        } catch (err) {
+          setStrategyError(err.message);
+        } finally {
+          setStrategyLoading(false);
+        }
+      })();
+      return;
+    }
+    (async () => {
+      setStrategyLoading(true);
+      setStrategyError("");
+      try {
+        setStrategyData(await api.strategy(strategyId, expiry, farExpiry));
+      } catch (err) {
+        setStrategyError(err.message);
+      } finally {
+        setStrategyLoading(false);
+      }
+    })();
+  }, [activeTab, expiry, farExpiry, otherSelection]);
+
+  const setGroupedStrategy = (group, strategy) => {
+    setOtherSelection((current) => ({ ...current, [group]: strategy }));
+    setStrategyData({ candidates: [] });
+    setStrategyError("");
+  };
+
+  const scanPortfolio = async () => {
+    const strategy = otherSelection["others-2"];
+    if (!["fence", "collar"].includes(strategy)) return;
+    setStrategyLoading(true);
+    setStrategyError("");
+    try {
+      setStrategyData(await api.portfolioStrategy({
+        expiry,
+        strategy,
+        ...portfolio,
+        limit: 10,
+      }));
+    } catch (err) {
+      setStrategyError(err.message);
+    } finally {
+      setStrategyLoading(false);
+    }
+  };
+
+  const selectCandidate = (candidate) => {
+    setSelected(candidate);
+    setReport(null);
+    setAnalysisOpen(true);
+  };
+  const closeAnalysis = useCallback(() => setAnalysisOpen(false), []);
+
+  return (
+    <div className="app-shell">
+      <header className="site-header">
+        <a href="https://trading-simplified.com/" className="brand">
+          <span className="brand-mark">TS</span>
+          <span>Trading Simplified<small>NIFTY Strategy Desk</small></span>
+        </a>
+      </header>
+
+      <main>
+        <section className="hero">
+          <div>
+            <p className="eyebrow">NIFTY · Options · Defined risk</p>
+            <h1>See the chain.<br /><em>Shape the trade.</em></h1>
+            <p>Live option structure, ranked spreads and grounded trade analysis in one focused desk.</p>
+          </div>
+          <div className="hero-stat">
+            <span>Underlying</span>
+            <strong>{chain ? number(chain.underlying_value) : "—"}</strong>
+            <small>{expiry || "Loading expiry…"}</small>
+          </div>
+        </section>
+
+        <StatusBar chain={chain} loading={loading} onRefresh={() => loadChain(expiry, true)} />
+        {error && <div className="alert">{error}</div>}
+        {chain?.stale && <div className="alert warning">NSE is unavailable. Showing cached data; verify prices before making any decision.</div>}
+
+        <section className="controls">
+          <label>Near expiry
+            <select value={expiry} onChange={(event) => setExpiry(event.target.value)}>
+              {expiries.map((item) => <option key={item}>{item}</option>)}
+            </select>
+          </label>
+          {(activeTab === "calendar" || activeTab === "diagonal" || (activeTab === "others-2" && otherSelection["others-2"] === "poor-mans-covered-call")) && (
+            <label>Far expiry
+              <select value={farExpiry} onChange={(event) => setFarExpiry(event.target.value)}>
+                {expiries.filter((item) => item !== expiry).map((item) => <option key={item}>{item}</option>)}
+              </select>
+            </label>
+          )}
+        </section>
+
+        <nav className="tabs" aria-label="Options tools">
+          {tabs.map(([id, label]) => (
+            <button key={id} className={activeTab === id ? "active" : ""} onClick={() => setActiveTab(id)}>
+              {label}
+              {id === "report" && selected && <span className="tab-dot" />}
+            </button>
+          ))}
+        </nav>
+
+        {activeTab === "chain" && chain && <ChainTable chain={chain} search={search} setSearch={setSearch} range={range} setRange={setRange} />}
+        {Object.entries(strategyCopy).map(([id, [title, description]]) => activeTab === id && (
+          <StrategyPanel key={id} title={title} description={description} guidance={strategyGuidance[id]} candidates={strategyData.candidates || []} loading={strategyLoading} error={strategyError} selected={selected} setSelected={selectCandidate} spot={chain?.underlying_value || 0} lotSize={chain?.lot_size || 1} />
+        ))}
+        {activeTab === "covered" && <>
+          <SuitabilityGuide title="Covered Call Proxy" guidance={strategyGuidance.covered} />
+          <CoveredCallForm expiry={expiry} onResults={setStrategyData} setLoading={setStrategyLoading} setError={setStrategyError} />
+          <StrategyPanel title="Call Overwrite Candidates" description="Premium choices compared with your entered NIFTYBEES exposure." candidates={strategyData.candidates || []} loading={strategyLoading} error={strategyError} selected={selected} setSelected={selectCandidate} spot={chain?.underlying_value || 0} lotSize={chain?.lot_size || 1} />
+        </>}
+        {Object.keys(otherGroups).map((group) => activeTab === group && (
+          <OtherStrategiesPanel
+            key={group}
+            group={group}
+            selectedStrategy={otherSelection[group]}
+            setSelectedStrategy={(strategy) => setGroupedStrategy(group, strategy)}
+            candidates={strategyData.candidates || []}
+            loading={strategyLoading}
+            error={strategyError}
+            selected={selected}
+            setSelected={selectCandidate}
+            spot={chain?.underlying_value || 0}
+            lotSize={chain?.lot_size || 1}
+            portfolio={portfolio}
+            setPortfolio={setPortfolio}
+            scanPortfolio={scanPortfolio}
+          />
+        ))}
+        {activeTab === "report" && <ReportPanel selected={selected} chain={chain} report={report} setReport={setReport} marketContext={marketContext} setMarketContext={setMarketContext} />}
+      </main>
+
+      <AnalysisModal
+        candidate={selected}
+        chain={chain}
+        open={analysisOpen}
+        onClose={closeAnalysis}
+        report={report}
+        setReport={setReport}
+        marketContext={marketContext}
+        setMarketContext={setMarketContext}
+      />
+
+      <footer>
+        <p><b>Educational use only.</b> This tool is not investment advice and does not provide execution-grade market data. The author is not SEBI registered.</p>
+        <a href="https://trading-simplified.com/">Back to Trading Simplified</a>
+      </footer>
+    </div>
+  );
+}
