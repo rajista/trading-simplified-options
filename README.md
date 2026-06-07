@@ -6,6 +6,9 @@ Public NIFTY option-chain and strategy analysis app for
 ## Features
 
 - NSE NIFTY option chain with expiry, strike search, range filtering and stale-data warnings
+- AI Recommends tab that combines option-chain candidates, Yahoo Finance global
+  market returns, RSS headlines and Gemini/rules analysis into five educational
+  trade ideas
 - Balanced ranking for debit, calendar and diagonal spreads
 - NIFTYBEES covered-call exposure proxy using user-entered holdings
 - Configurable NIFTY lot multiplier, defaulting to 65

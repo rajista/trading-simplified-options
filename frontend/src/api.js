@@ -16,6 +16,11 @@ export const api = {
     request(`/api/chain?expiry=${encodeURIComponent(expiry)}${refresh ? "&refresh=true" : ""}`),
   marketContext: (refresh = false) =>
     request(`/api/market-context${refresh ? "?refresh=true" : ""}`),
+  recommendations: (payload) =>
+    request("/api/recommendations", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   strategy: (type, expiry, farExpiry) => {
     const params = new URLSearchParams({ expiry });
     if (farExpiry) params.set("far_expiry", farExpiry);

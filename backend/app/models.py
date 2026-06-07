@@ -181,3 +181,59 @@ class AnalysisResponse(BaseModel):
     net_debit: float | None = None
     net_credit: float | None = None
     assumptions: list[str]
+
+
+class MarketMove(BaseModel):
+    symbol: str
+    name: str
+    last: float | None = None
+    one_day_return: float | None = None
+    one_week_return: float | None = None
+    timestamp: str | None = None
+    source: str = "Yahoo Finance"
+
+
+class NewsItem(BaseModel):
+    title: str
+    source: str
+    published: str | None = None
+    url: str | None = None
+
+
+class RecommendationChartPoint(BaseModel):
+    underlying_price: float
+    pnl: float
+
+
+class AITradeIdea(BaseModel):
+    title: str
+    strategy: str
+    outlook: str
+    recommendation: str
+    background: str
+    analysis: str
+    entry_plan: str
+    risk_management: str
+    confidence: Literal["low", "medium", "high"]
+    candidate: StrategyCandidate | None = None
+    chart_points: list[RecommendationChartPoint] = []
+
+
+class RecommendationRequest(BaseModel):
+    expiry: str
+    far_expiry: str | None = None
+    analysis_date: str
+    refresh: bool = False
+
+
+class RecommendationResponse(BaseModel):
+    analysis_date: str
+    generated_by: Literal["gemini", "rules"]
+    chain_timestamp: str
+    underlying_value: float
+    market_context: MarketContext
+    global_markets: list[MarketMove]
+    news: list[NewsItem]
+    ideas: list[AITradeIdea]
+    assumptions: list[str]
+    disclaimer: str

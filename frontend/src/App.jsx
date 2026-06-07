@@ -15,6 +15,7 @@ import { api } from "./api";
 
 const tabs = [
   ["chain", "Option Chain"],
+  ["ai-recommends", "AI Recommends"],
   ["debit", "Debit Spreads"],
   ["credit", "Credit Spreads"],
   ["iron-condor", "Iron Condors"],
@@ -42,6 +43,8 @@ const money = (value) =>
 
 const number = (value, digits = 2) =>
   value == null ? "—" : Number(value).toLocaleString("en-IN", { maximumFractionDigits: digits });
+
+const today = () => new Date().toISOString().slice(0, 10);
 
 const strategyCopy = {
   debit: ["Debit Spreads", "Defined-risk directional structures ranked across calls and puts."],
@@ -297,6 +300,147 @@ function AnalysisTooltip({ active, payload, label }) {
         </div>
       ))}
     </div>
+  );
+}
+
+function RecommendationMiniChart({ points }) {
+  if (!points?.length) return <div className="empty mini-empty">Chart unavailable for this idea.</div>;
+  return (
+    <div className="recommend-chart">
+      <ResponsiveContainer width="100%" height={180}>
+        <ComposedChart data={points} margin={{ top: 12, right: 18, bottom: 8, left: 8 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#dedbd2" />
+          <XAxis dataKey="underlying_price" tickFormatter={(value) => number(value, 0)} />
+          <YAxis tickFormatter={(value) => `₹${number(value, 0)}`} width={70} />
+          <Tooltip />
+          <ReferenceLine y={0} stroke="#798092" />
+          <Line type="monotone" dataKey="pnl" name="Scenario P&L" stroke="#0b8a65" strokeWidth={2.5} dot={false} />
+        </ComposedChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function AIRecommendsPanel({ expiry, farExpiry, chain }) {
+  const [analysisDate, setAnalysisDate] = useState(today());
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const generate = async (refresh = false) => {
+    if (!expiry) return;
+    setLoading(true);
+    setError("");
+    try {
+      setData(await api.recommendations({
+        expiry,
+        far_expiry: farExpiry,
+        analysis_date: analysisDate,
+        refresh,
+      }));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!expiry) return;
+    generate(false);
+  }, [expiry, farExpiry]);
+
+  return (
+    <section>
+      <div className="section-intro wide">
+        <p className="eyebrow">AI market desk</p>
+        <h2>AI Recommends</h2>
+        <p>Gemini receives the selected date, option-chain snapshot, scanner candidates, RSS headlines and Yahoo Finance return snapshots for US markets, oil, gold and Asian indices.</p>
+      </div>
+      <div className="recommend-controls panel">
+        <label>Analysis date
+          <input type="date" value={analysisDate} onChange={(event) => setAnalysisDate(event.target.value)} />
+        </label>
+        <button className="button" onClick={() => generate(false)} disabled={loading}>{loading ? "Generating…" : "Generate 5 ideas"}</button>
+        <button className="button ghost" onClick={() => generate(true)} disabled={loading}>Refresh data</button>
+        <p>Current NIFTY: <b>{chain ? number(chain.underlying_value) : "—"}</b>. Ideas are educational and must be checked against live prices.</p>
+      </div>
+      {error && <div className="alert">{error}</div>}
+      {loading && <div className="loading-card">Collecting option chain, RSS, Yahoo Finance returns and recommendation context…</div>}
+      {data && (
+        <>
+          <div className="recommend-summary">
+            <article>
+              <p className="eyebrow">Source</p>
+              <h3>{data.generated_by === "gemini" ? "Gemini recommendations" : "Rules fallback"}</h3>
+              <p>Chain timestamp: {data.chain_timestamp}</p>
+              <p>NIFTY trend: {data.market_context.short_term_trend} short term, {data.market_context.medium_term_trend} medium term.</p>
+            </article>
+            <article>
+              <p className="eyebrow">Momentum and volatility</p>
+              <h3>{data.market_context.momentum}</h3>
+              <p>{data.market_context.volatility_regime}</p>
+            </article>
+          </div>
+          <section className="market-moves">
+            <div className="section-intro compact">
+              <p className="eyebrow">Yahoo Finance return snapshot</p>
+              <h2>Global Market Inputs</h2>
+            </div>
+            <div className="move-grid">
+              {data.global_markets.map((move) => (
+                <article key={move.symbol} className="move-card">
+                  <span>{move.symbol}</span>
+                  <h3>{move.name}</h3>
+                  <p>Last: {number(move.last)}</p>
+                  <p className={(move.one_day_return || 0) >= 0 ? "positive" : "negative"}>1D: {move.one_day_return == null ? "—" : `${number(move.one_day_return)}%`}</p>
+                  <p className={(move.one_week_return || 0) >= 0 ? "positive" : "negative"}>1W: {move.one_week_return == null ? "—" : `${number(move.one_week_return)}%`}</p>
+                </article>
+              ))}
+            </div>
+          </section>
+          <section className="news-panel panel">
+            <p className="eyebrow">RSS news inputs</p>
+            <h2>Headlines Fed To Gemini</h2>
+            {!data.news.length && <p className="muted">No RSS headlines were available. Gemini is told not to invent news.</p>}
+            <ul>
+              {data.news.map((item) => (
+                <li key={`${item.source}-${item.title}`}>
+                  {item.url ? <a href={item.url} target="_blank" rel="noreferrer">{item.title}</a> : item.title}
+                  <span>{item.source}{item.published ? ` · ${item.published}` : ""}</span>
+                </li>
+              ))}
+            </ul>
+          </section>
+          <div className="recommend-grid">
+            {data.ideas.map((idea, index) => (
+              <article className="recommend-card" key={`${idea.title}-${index}`}>
+                <span className="score">Idea {index + 1} · {idea.confidence} confidence</span>
+                <h3>{idea.title}</h3>
+                <p className="muted">{idea.strategy} · {idea.outlook}</p>
+                <p><b>Recommendation:</b> {idea.recommendation}</p>
+                <p><b>Background:</b> {idea.background}</p>
+                <p><b>Analysis:</b> {idea.analysis}</p>
+                <p><b>Entry plan:</b> {idea.entry_plan}</p>
+                <p><b>Risk management:</b> {idea.risk_management}</p>
+                {idea.candidate && (
+                  <div className="legs">
+                    {idea.candidate.legs.map((leg, legIndex) => (
+                      <div className={`leg ${leg.action.toLowerCase()}`} key={`${idea.title}-${legIndex}`}>
+                        <b>{leg.action}</b> {leg.quantity > 1 ? `${leg.quantity}x ` : ""}{leg.option_type} {number(leg.strike, 0)}
+                        <span>{leg.expiry} · {number(leg.price)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <RecommendationMiniChart points={idea.chart_points} />
+              </article>
+            ))}
+          </div>
+          <div className="disclaimer">{data.disclaimer}</div>
+        </>
+      )}
+    </section>
   );
 }
 
@@ -979,6 +1123,7 @@ export default function App() {
         </nav>
 
         {activeTab === "chain" && chain && <ChainTable chain={chain} search={search} setSearch={setSearch} range={range} setRange={setRange} />}
+        {activeTab === "ai-recommends" && <AIRecommendsPanel expiry={expiry} farExpiry={farExpiry} chain={chain} />}
         {Object.entries(strategyCopy).map(([id, [title, description]]) => activeTab === id && (
           <StrategyPanel key={id} title={title} description={description} guidance={strategyGuidance[id]} candidates={strategyData.candidates || []} loading={strategyLoading} error={strategyError} selected={selected} setSelected={selectCandidate} spot={chain?.underlying_value || 0} lotSize={chain?.lot_size || 1} />
         ))}

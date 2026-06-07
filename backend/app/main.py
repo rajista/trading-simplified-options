@@ -17,6 +17,8 @@ from .models import (
     MarketContext,
     OptionChain,
     PortfolioStrategyRequest,
+    RecommendationRequest,
+    RecommendationResponse,
     ReportRequest,
     StrategyResponse,
     TradeReport,
@@ -24,6 +26,7 @@ from .models import (
 from .analysis import analyze_candidate
 from .market_context import market_context_service
 from .provider import MarketDataError, provider
+from .recommendations import recommendation_service
 from .reports import ReportRateLimit, ReportUnavailable, report_service
 from .strategies import (
     scan_broken_wing_butterflies,
@@ -82,7 +85,7 @@ async def request_logging(request: Request, call_next):
 def health():
     return {
         "status": "ok",
-        "app_version": "2.1.0",
+        "app_version": "2.2.0",
         "symbol": "NIFTY",
         "lot_size": settings.nifty_lot_size,
         "ai_reports_configured": bool(settings.gemini_api_key),
@@ -239,6 +242,17 @@ def report(request: ReportRequest, raw_request: Request):
     except ReportRateLimit as error:
         raise HTTPException(status_code=429, detail=str(error)) from error
     except ReportUnavailable as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.post("/api/recommendations", response_model=RecommendationResponse)
+def recommendations(request: RecommendationRequest, raw_request: Request):
+    client_ip = raw_request.client.host if raw_request.client else "unknown"
+    try:
+        return recommendation_service.generate(request, client_ip)
+    except ValueError as error:
+        raise HTTPException(status_code=429, detail=str(error)) from error
+    except MarketDataError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 
