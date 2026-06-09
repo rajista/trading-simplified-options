@@ -9,6 +9,7 @@ class Settings:
     nifty_lot_size: int = int(os.getenv("NIFTY_LOT_SIZE", "65"))
     gemini_api_key: str | None = os.getenv("GEMINI_API_KEY")
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    market_events_json: str = os.getenv("MARKET_EVENTS_JSON", "[]")
     cors_origins: tuple[str, ...] = tuple(
         origin.strip()
         for origin in os.getenv(

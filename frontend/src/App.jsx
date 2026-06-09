@@ -321,7 +321,7 @@ function RecommendationMiniChart({ points }) {
   );
 }
 
-function AIRecommendsPanel({ expiry, farExpiry, chain }) {
+function AIRecommendsPanelLegacy({ expiry, farExpiry, chain }) {
   const [analysisDate, setAnalysisDate] = useState(today());
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -423,6 +423,222 @@ function AIRecommendsPanel({ expiry, farExpiry, chain }) {
                 <p><b>Analysis:</b> {idea.analysis}</p>
                 <p><b>Entry plan:</b> {idea.entry_plan}</p>
                 <p><b>Risk management:</b> {idea.risk_management}</p>
+                {idea.candidate && (
+                  <div className="legs">
+                    {idea.candidate.legs.map((leg, legIndex) => (
+                      <div className={`leg ${leg.action.toLowerCase()}`} key={`${idea.title}-${legIndex}`}>
+                        <b>{leg.action}</b> {leg.quantity > 1 ? `${leg.quantity}x ` : ""}{leg.option_type} {number(leg.strike, 0)}
+                        <span>{leg.expiry} · {number(leg.price)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <RecommendationMiniChart points={idea.chart_points} />
+              </article>
+            ))}
+          </div>
+          <div className="disclaimer">{data.disclaimer}</div>
+        </>
+      )}
+    </section>
+  );
+}
+
+function EvidencePanel({ title, subtitle, children, open = false }) {
+  return (
+    <details className="evidence-panel panel" open={open}>
+      <summary><span>{title}</span><small>{subtitle}</small></summary>
+      <div className="evidence-content">{children}</div>
+    </details>
+  );
+}
+
+function EvidenceMetric({ label, value, suffix = "" }) {
+  return (
+    <div className="evidence-metric">
+      <span>{label}</span>
+      <b>{value == null ? "—" : `${typeof value === "string" ? value : number(value)}${suffix}`}</b>
+    </div>
+  );
+}
+
+function AIRecommendsPanel({ expiry, farExpiry }) {
+  const [analysisDate, setAnalysisDate] = useState(today());
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const generate = async (refresh = false) => {
+    if (!expiry) return;
+    setLoading(true);
+    setError("");
+    try {
+      setData(await api.recommendations({
+        expiry,
+        far_expiry: farExpiry,
+        analysis_date: analysisDate,
+        refresh,
+      }));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (expiry) generate(false);
+  }, [expiry, farExpiry]);
+
+  return (
+    <section>
+      <div className="section-intro wide">
+        <p className="eyebrow">AI market desk</p>
+        <h2>AI Recommends</h2>
+        <p>Gemini explains server-calculated NIFTY indicators, option-chain structure, scanner candidates, verified events, supplied headlines and timestamped cross-market evidence.</p>
+      </div>
+      <div className="recommend-controls panel">
+        <label>Report date
+          <input type="date" value={analysisDate} onChange={(event) => setAnalysisDate(event.target.value)} />
+        </label>
+        <button className="button" onClick={() => generate(false)} disabled={loading}>{loading ? "Generating…" : "Generate 5 ideas"}</button>
+        <button className="button ghost" onClick={() => generate(true)} disabled={loading}>Refresh data</button>
+        <p><b>Latest-data report:</b> the date labels the report. Market inputs use their latest available timestamps; this is not historical analysis.</p>
+      </div>
+      {error && <div className="alert">{error}</div>}
+      {loading && <div className="loading-card">Calculating indicators, chain structure, correlations, events and grounded recommendations…</div>}
+      {data && (
+        <>
+          <div className="recommend-summary">
+            <article>
+              <p className="eyebrow">Source and validation</p>
+              <h3>{data.generated_by === "gemini" ? "Gemini recommendations" : "Rules fallback"}</h3>
+              <p>Chain timestamp: {data.chain_timestamp}</p>
+              <p>Validation: {data.validation_status}</p>
+              {data.fallback_reason && <p className="negative">{data.fallback_reason}</p>}
+            </article>
+            <article>
+              <p className="eyebrow">Trend, momentum and freshness</p>
+              <h3>{data.market_context.short_term_trend} / {data.market_context.medium_term_trend}</h3>
+              <p>{data.market_context.momentum}</p>
+              <p>{data.market_context.volatility_regime}</p>
+              {!!data.stale_inputs?.length && <p className="negative">Stale or unavailable: {data.stale_inputs.join(", ")}</p>}
+            </article>
+          </div>
+
+          <div className="evidence-stack">
+            <EvidencePanel title="NIFTY Indicators and Price Action" subtitle={`Yahoo Finance · ${data.technical_indicators.timestamp || "timestamp unavailable"}`} open>
+              <div className="evidence-metrics">
+                <EvidenceMetric label="NIFTY" value={data.technical_indicators.last} />
+                <EvidenceMetric label="1D return" value={data.technical_indicators.return_1d} suffix="%" />
+                <EvidenceMetric label="5D return" value={data.technical_indicators.return_5d} suffix="%" />
+                <EvidenceMetric label="20D return" value={data.technical_indicators.return_20d} suffix="%" />
+                <EvidenceMetric label="3M return" value={data.technical_indicators.return_3m} suffix="%" />
+                <EvidenceMetric label="SMA 20 / 50" value={data.technical_indicators.sma_20 == null ? null : `${number(data.technical_indicators.sma_20)} / ${number(data.technical_indicators.sma_50)}`} />
+                <EvidenceMetric label="SMA 200" value={data.technical_indicators.sma_200} />
+                <EvidenceMetric label="EMA 9 / 21" value={data.technical_indicators.ema_9 == null ? null : `${number(data.technical_indicators.ema_9)} / ${number(data.technical_indicators.ema_21)}`} />
+                <EvidenceMetric label="RSI 14" value={data.technical_indicators.rsi_14} />
+                <EvidenceMetric label="MACD / signal" value={data.technical_indicators.macd == null ? null : `${number(data.technical_indicators.macd)} / ${number(data.technical_indicators.macd_signal)}`} />
+                <EvidenceMetric label="ATR 14" value={data.technical_indicators.atr_14} />
+                <EvidenceMetric label="ATR %" value={data.technical_indicators.atr_percent} suffix="%" />
+                <EvidenceMetric label="Realized vol 10D / 20D" value={data.technical_indicators.realized_volatility_10d == null ? null : `${number(data.technical_indicators.realized_volatility_10d)}% / ${number(data.technical_indicators.realized_volatility_20d)}%`} />
+                <EvidenceMetric label="Bollinger position" value={data.technical_indicators.bollinger_position} />
+                <EvidenceMetric label="Support" value={data.technical_indicators.support} />
+                <EvidenceMetric label="Resistance" value={data.technical_indicators.resistance} />
+              </div>
+            </EvidencePanel>
+
+            <EvidencePanel title="Option-Chain Structure and OI Walls" subtitle={data.option_chain_summary?.timestamp || "timestamp unavailable"}>
+              {data.option_chain_summary && (
+                <div className="evidence-metrics">
+                  <EvidenceMetric label="ATM strike" value={data.option_chain_summary.atm_strike} />
+                  <EvidenceMetric label="Strike interval" value={data.option_chain_summary.strike_interval} />
+                  <EvidenceMetric label="ATM CE / PE LTP" value={`${number(data.option_chain_summary.atm_ce_ltp)} / ${number(data.option_chain_summary.atm_pe_ltp)}`} />
+                  <EvidenceMetric label="Straddle / move proxy" value={data.option_chain_summary.expected_move_points} />
+                  <EvidenceMetric label="Expected move" value={data.option_chain_summary.expected_move_percent} suffix="%" />
+                  <EvidenceMetric label="ATM IV" value={data.option_chain_summary.atm_iv} suffix="%" />
+                  <EvidenceMetric label="Put-call IV skew" value={data.option_chain_summary.call_put_iv_skew} />
+                  <EvidenceMetric label="Total OI PCR" value={data.option_chain_summary.total_oi_pcr} />
+                  <EvidenceMetric label="Near-ATM PCR" value={data.option_chain_summary.near_atm_oi_pcr} />
+                  <EvidenceMetric label="Change OI PCR" value={data.option_chain_summary.change_oi_pcr} />
+                  <EvidenceMetric label="Put OI wall" value={data.option_chain_summary.put_oi_wall} />
+                  <EvidenceMetric label="Call OI wall" value={data.option_chain_summary.call_oi_wall} />
+                  <EvidenceMetric label="Estimated max pain" value={data.option_chain_summary.estimated_max_pain} />
+                </div>
+              )}
+              <p className="context-note">Expected move is an ATM-straddle proxy. Max pain is an open-interest estimate, not a forecast.</p>
+            </EvidencePanel>
+
+            <EvidencePanel title="Nearby Verified Events" subtitle="Seven calendar days before or after the report date">
+              {!data.market_events.length && <p className="muted">No verified nearby event was available. Gemini is instructed to say so.</p>}
+              <div className="event-list">
+                {data.market_events.map((event) => (
+                  <article key={event.id}>
+                    <b>{event.date} · {event.title}</b>
+                    <span>{event.importance} importance · {event.source} · {event.verified ? "verified" : "unverified"}</span>
+                    {event.source_url && <a href={event.source_url} target="_blank" rel="noreferrer">Official source</a>}
+                  </article>
+                ))}
+              </div>
+            </EvidencePanel>
+
+            <EvidencePanel title="Global Returns and Correlations" subtitle="Yahoo Finance, best effort">
+              <div className="move-grid">
+                {data.global_markets.map((move) => (
+                  <article key={move.symbol} className="move-card">
+                    <span>{move.symbol}</span>
+                    <h3>{move.name}</h3>
+                    <p>Last: {number(move.last)}</p>
+                    <p className={(move.one_day_return || 0) >= 0 ? "positive" : "negative"}>1D: {move.one_day_return == null ? "—" : `${number(move.one_day_return)}%`}</p>
+                    <p>1W / 1M: {move.one_week_return == null ? "—" : `${number(move.one_week_return)}%`} / {move.one_month_return == null ? "—" : `${number(move.one_month_return)}%`}</p>
+                    <p>Corr. 20D / 60D: {number(move.correlation_20d)} / {number(move.correlation_60d)}</p>
+                    <small>{move.timestamp || "timestamp unavailable"}</small>
+                  </article>
+                ))}
+              </div>
+            </EvidencePanel>
+
+            <EvidencePanel title="Exact Headlines Supplied to Gemini" subtitle={`${data.news.length} contextual RSS items`}>
+              <div className="news-panel embedded">
+                {!data.news.length && <p className="muted">No RSS headlines were available. Gemini is told not to invent news.</p>}
+                <ul>
+                  {data.news.map((item) => (
+                    <li key={item.id || `${item.source}-${item.title}`}>
+                      <code>{item.id}</code>
+                      {item.url ? <a href={item.url} target="_blank" rel="noreferrer">{item.title}</a> : item.title}
+                      <span>{item.source}{item.published ? ` · ${item.published}` : ""}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </EvidencePanel>
+          </div>
+
+          <div className="section-intro compact recommendation-heading">
+            <p className="eyebrow">Grounded output</p>
+            <h2>Five Trade-Plan Slots</h2>
+            <p>Each trade is attached to a server-ranked candidate. Missing qualified families are shown as No Trade / Wait.</p>
+          </div>
+          <div className="recommend-grid">
+            {data.ideas.map((idea, index) => (
+              <article className="recommend-card" key={`${idea.title}-${index}`}>
+                <span className="score">Idea {index + 1} · {idea.confidence} confidence</span>
+                <h3>{idea.title}</h3>
+                <p className="muted">{idea.strategy} · {idea.outlook}</p>
+                <div className="risk-provenance">
+                  <b>{idea.risk_label}</b>
+                  <span>{idea.confidence_rationale}</span>
+                </div>
+                <p><b>Recommendation:</b> {idea.recommendation}</p>
+                <p><b>Background:</b> {idea.background}</p>
+                <p><b>Analysis:</b> {idea.analysis}</p>
+                <p><b>Entry plan:</b> {idea.entry_plan}</p>
+                <p><b>Risk management:</b> {idea.risk_management}</p>
+                {!!idea.evidence?.length && (
+                  <div className="evidence-chips">
+                    {idea.evidence.map((item) => <span key={`${item.kind}-${item.id}`}>{item.kind}: {item.label}</span>)}
+                  </div>
+                )}
                 {idea.candidate && (
                   <div className="legs">
                     {idea.candidate.legs.map((leg, legIndex) => (

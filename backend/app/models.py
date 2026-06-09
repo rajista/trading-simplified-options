@@ -189,15 +189,97 @@ class MarketMove(BaseModel):
     last: float | None = None
     one_day_return: float | None = None
     one_week_return: float | None = None
+    one_month_return: float | None = None
+    correlation_20d: float | None = None
+    correlation_60d: float | None = None
     timestamp: str | None = None
     source: str = "Yahoo Finance"
+    stale: bool = False
 
 
 class NewsItem(BaseModel):
+    id: str = ""
     title: str
     source: str
     published: str | None = None
     url: str | None = None
+
+
+class TechnicalIndicators(BaseModel):
+    last: float | None = None
+    return_1d: float | None = None
+    return_5d: float | None = None
+    return_20d: float | None = None
+    return_3m: float | None = None
+    sma_20: float | None = None
+    sma_50: float | None = None
+    sma_200: float | None = None
+    ema_9: float | None = None
+    ema_21: float | None = None
+    rsi_14: float | None = None
+    macd: float | None = None
+    macd_signal: float | None = None
+    macd_histogram: float | None = None
+    atr_14: float | None = None
+    atr_percent: float | None = None
+    bollinger_position: float | None = None
+    realized_volatility_10d: float | None = None
+    realized_volatility_20d: float | None = None
+    support: float | None = None
+    resistance: float | None = None
+    swing_low: float | None = None
+    swing_high: float | None = None
+    distance_to_support_pct: float | None = None
+    distance_to_resistance_pct: float | None = None
+    timestamp: str | None = None
+    source: str = "Yahoo Finance ^NSEI"
+    stale: bool = False
+
+
+class OILevel(BaseModel):
+    strike: float
+    value: int
+
+
+class OptionChainSummary(BaseModel):
+    spot: float
+    atm_strike: float | None = None
+    strike_interval: float | None = None
+    atm_ce_ltp: float | None = None
+    atm_pe_ltp: float | None = None
+    atm_straddle_premium: float | None = None
+    expected_move_points: float | None = None
+    expected_move_percent: float | None = None
+    atm_iv: float | None = None
+    call_put_iv_skew: float | None = None
+    total_oi_pcr: float | None = None
+    near_atm_oi_pcr: float | None = None
+    change_oi_pcr: float | None = None
+    largest_call_oi: OILevel | None = None
+    largest_put_oi: OILevel | None = None
+    largest_call_oi_change: OILevel | None = None
+    largest_put_oi_change: OILevel | None = None
+    call_oi_wall: float | None = None
+    put_oi_wall: float | None = None
+    estimated_max_pain: float | None = None
+    timestamp: str
+    stale: bool = False
+
+
+class MarketEvent(BaseModel):
+    id: str
+    date: str
+    title: str
+    importance: Literal["low", "medium", "high"] = "medium"
+    source: str
+    source_url: str | None = None
+    verified: bool = False
+
+
+class EvidenceReference(BaseModel):
+    kind: Literal["headline", "event", "market", "indicator", "chain"]
+    id: str
+    label: str
 
 
 class RecommendationChartPoint(BaseModel):
@@ -215,6 +297,10 @@ class AITradeIdea(BaseModel):
     entry_plan: str
     risk_management: str
     confidence: Literal["low", "medium", "high"]
+    confidence_rationale: str = ""
+    candidate_id: str | None = None
+    risk_label: str = ""
+    evidence: list[EvidenceReference] = []
     candidate: StrategyCandidate | None = None
     chart_points: list[RecommendationChartPoint] = []
 
@@ -232,8 +318,15 @@ class RecommendationResponse(BaseModel):
     chain_timestamp: str
     underlying_value: float
     market_context: MarketContext
+    technical_indicators: TechnicalIndicators = TechnicalIndicators()
+    option_chain_summary: OptionChainSummary | None = None
+    market_events: list[MarketEvent] = []
     global_markets: list[MarketMove]
     news: list[NewsItem]
     ideas: list[AITradeIdea]
+    input_timestamps: dict[str, str | None] = {}
+    stale_inputs: list[str] = []
+    validation_status: str = "not-run"
+    fallback_reason: str | None = None
     assumptions: list[str]
     disclaimer: str

@@ -7,8 +7,8 @@ Public NIFTY option-chain and strategy analysis app for
 
 - NSE NIFTY option chain with expiry, strike search, range filtering and stale-data warnings
 - AI Recommends tab that combines option-chain candidates, Yahoo Finance global
-  market returns, RSS headlines and Gemini/rules analysis into five educational
-  trade ideas
+  market returns and correlations, NIFTY indicators, OI structure, verified
+  events, RSS headlines and Gemini/rules analysis into five grounded trade slots
 - Balanced ranking for debit, calendar and diagonal spreads
 - NIFTYBEES covered-call exposure proxy using user-entered holdings
 - Configurable NIFTY lot multiplier, defaulting to 65
@@ -70,10 +70,20 @@ The Docker image builds the React app and serves it from FastAPI.
    `"ai_provider": "gemini"`. Generate a report and confirm the source badge
    says **Gemini**. Missing keys, exhausted quota, API failures or invalid
    structured output use the **Rules fallback** report.
-5. Review `NIFTY_LOT_SIZE` whenever NSE changes the contract specification.
-6. In Render, add the custom domain `options.trading-simplified.com`.
-7. Add Render's requested CNAME record in the domain's DNS settings.
-8. Wait for Render to issue HTTPS and verify `/api/health`.
+5. Optionally add `MARKET_EVENTS_JSON` as a one-line JSON array of verified
+   scheduled events. Example:
+
+```json
+[{"id":"rbi-mpc-2026-08","date":"2026-08-07","title":"RBI MPC decision","importance":"high","source":"RBI published schedule","source_url":"https://www.rbi.org.in/","verified":true}]
+```
+
+   Only events within seven days before or after the selected report date are
+   sent to Gemini. RBI RSS announcements and NSE holiday context are also
+   collected from their official websites.
+6. Review `NIFTY_LOT_SIZE` whenever NSE changes the contract specification.
+7. In Render, add the custom domain `options.trading-simplified.com`.
+8. Add Render's requested CNAME record in the domain's DNS settings.
+9. Wait for Render to issue HTTPS and verify `/api/health`.
 
 ## Report context
 
