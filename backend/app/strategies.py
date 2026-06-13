@@ -132,23 +132,37 @@ def _fixed_metrics(
     strikes = [leg.strike for leg in legs]
     low = min(low, min(strikes) * 0.95)
     high = max(high, max(strikes) * 1.05)
-    step = max(1, (high - low) / 240)
+    prices = sorted({low, high, *strikes})
     points = [
         (
-            low + i * step,
+            price,
             _expiry_payoff(
                 legs,
-                low + i * step,
+                price,
                 lot_size,
                 reference_spot=spot,
                 metadata=metadata,
             ),
         )
-        for i in range(241)
+        for price in prices
     ]
     values = [value for _, value in points]
-    left_slope = points[1][1] - points[0][1]
-    right_slope = points[-1][1] - points[-2][1]
+    left_probe = min(high, low + 1)
+    right_probe = max(low, high - 1)
+    left_slope = _expiry_payoff(
+        legs,
+        left_probe,
+        lot_size,
+        reference_spot=spot,
+        metadata=metadata,
+    ) - points[0][1]
+    right_slope = points[-1][1] - _expiry_payoff(
+        legs,
+        right_probe,
+        lot_size,
+        reference_spot=spot,
+        metadata=metadata,
+    )
     bounded_profit = right_slope <= 0.01 and left_slope >= -0.01
     bounded_loss = right_slope >= -0.01 and left_slope <= 0.01
     max_profit = max(values) if bounded_profit else None

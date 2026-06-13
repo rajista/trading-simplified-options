@@ -1,8 +1,13 @@
 from types import SimpleNamespace
 
+import pytest
+
+from app.desk_analysis import PROMPT_VERSION
 from app.models import (
-    MarketContext,
+    MarketEvidencePacket,
     MarketMove,
+    OptionChainSummary,
+    RecommendationNarrativeRequest,
     RecommendationRequest,
     TechnicalIndicators,
 )
@@ -10,119 +15,201 @@ from app.recommendations import GeminiIdea, GeminiRecommendation, Recommendation
 from test_strategies import chain
 
 
-def test_recommendation_rules_fallback_returns_five_ideas(monkeypatch):
+def evidence(test_chain):
+    return MarketEvidencePacket(
+        report_date="2026-06-07",
+        chain_timestamp=test_chain.timestamp,
+        technical_indicators=TechnicalIndicators(
+            last=test_chain.underlying_value,
+            timestamp="2026-06-07T00:00:00+00:00",
+        ),
+        option_chain_summary=OptionChainSummary(
+            spot=test_chain.underlying_value,
+            timestamp=test_chain.timestamp,
+        ),
+        global_markets=[
+            MarketMove(
+                symbol="^GSPC",
+                name="S&P 500",
+                last=100,
+                timestamp="2026-06-07T00:00:00+00:00",
+            )
+        ],
+        news=[],
+        market_events=[],
+        short_term_trend="Mixed",
+        medium_term_trend="Sideways",
+        momentum_strength="Neutral",
+        volatility_regime="Normal",
+        iv_premium_regime="Near realized volatility",
+        option_chain_bias="Balanced",
+        event_risk="No verified nearby event",
+    )
+
+
+def setup_service(monkeypatch):
     service = RecommendationService()
     test_chain = chain()
-    monkeypatch.setattr("app.recommendations.settings", SimpleNamespace(gemini_api_key=None, gemini_model="gemini-2.5-flash-lite"))
-    monkeypatch.setattr("app.recommendations.provider.get_chain", lambda expiry, force=False: test_chain)
-    monkeypatch.setattr("app.recommendations.market_context_service.get", lambda force=False: MarketContext(
-        short_term_trend="Bullish",
-        medium_term_trend="Sideways",
-        momentum="Positive",
-        volatility_regime="Normal",
-        stale=False,
-        data_timestamp="07-Jun-2026 15:30:00",
-    ))
-    monkeypatch.setattr(service, "_news", lambda: [])
-    monkeypatch.setattr(service, "_events", lambda analysis_date: [])
     monkeypatch.setattr(
-        service,
-        "_technical_indicators",
-        lambda: (
-            TechnicalIndicators(
-                last=23366,
-                ema_9=23400,
-                ema_21=23300,
-                rsi_14=55,
-                timestamp="2026-06-07T00:00:00+00:00",
-            ),
-            {},
-        ),
+        "app.recommendations.provider.get_chain",
+        lambda expiry, force=False: test_chain.model_copy(update={"expiry": expiry}),
     )
-    monkeypatch.setattr(
-        service,
-        "_market_move",
-        lambda symbol, name, nifty_prices=None: MarketMove(
-            symbol=symbol,
-            name=name,
-            last=100,
-            one_day_return=1,
-            one_week_return=2,
-            timestamp="2026-06-07T00:00:00+00:00",
-            source="Yahoo Finance",
-        ),
-    )
-    result = service.generate(
+    monkeypatch.setattr(service, "_cached_evidence", lambda chain, date: evidence(chain))
+    return service, test_chain
+
+
+def test_preview_returns_cards_before_narrative(monkeypatch):
+    service, _ = setup_service(monkeypatch)
+    result = service.preview(
         RecommendationRequest(
             expiry="09-Jun-2026",
             far_expiry="16-Jun-2026",
             analysis_date="2026-06-07",
-        ),
+        )
+    )
+    assert result.analysis_id
+    assert result.narrative_pending
+    assert result.validation_status == "preview-ready"
+    assert len(result.ideas) == 5
+    assert len(result.high_risk_ideas) == 2
+    assert result.ideas[0].candidate
+    assert result.ideas[0].chart_points
+    assert result.ideas[0].desk_analysis is None
+
+
+def test_missing_key_returns_concise_rules_narrative(monkeypatch):
+    service, _ = setup_service(monkeypatch)
+    monkeypatch.setattr(
+        "app.recommendations.settings",
+        SimpleNamespace(gemini_api_key=None),
+    )
+    preview = service.preview(
+        RecommendationRequest(
+            expiry="09-Jun-2026",
+            far_expiry="16-Jun-2026",
+            analysis_date="2026-06-07",
+        )
+    )
+    result = service.narrative(
+        RecommendationNarrativeRequest(analysis_id=preview.analysis_id),
         "127.0.0.1",
     )
     assert result.generated_by == "rules"
-    assert len(result.ideas) == 5
-    assert result.ideas[0].chart_points
-    assert len(result.global_markets) >= 5
-    assert result.option_chain_summary.atm_strike == 23400
     assert result.validation_status == "rules-fallback"
-
-
-def test_gemini_validation_rejects_unknown_references_and_duplicate_family():
-    service = RecommendationService()
-    candidates = service._candidate_pool(chain(), chain("16-Jun-2026", premium_shift=40))
-    first = candidates[0]
-    same_family = next(
-        item for item in candidates[1:] if service._family(item) == service._family(first)
+    assert result.fallback_reason == (
+        "AI commentary was unavailable, so a concise desk view is shown."
     )
+    analysis = result.ideas[0].desk_analysis
+    assert analysis
+    assert service._sentence_count(analysis.thesis) in {2, 3}
+    assert service._sentence_count(analysis.entry) == 1
+    assert service._sentence_count(analysis.risk_exit) == 1
+    assert not hasattr(analysis, "monitoring_checklist")
+    assert not hasattr(analysis, "word_count")
 
-    def idea(candidate_id, suffix):
-        return GeminiIdea(
-            candidate_id=candidate_id,
-            title=f"Idea {suffix}",
-            outlook="Neutral",
-            recommendation=f"Recommendation {suffix}",
-            background=f"Distinct background {suffix}",
-            analysis=f"Distinct analysis {suffix}",
-            entry_plan=f"Distinct entry {suffix}",
-            risk_management=f"Distinct risk {suffix}",
-            headline_ids=["missing-news"] if suffix == 1 else [],
-        )
 
+def test_concise_validation_allows_missing_global_references(monkeypatch):
+    service, test_chain = setup_service(monkeypatch)
+    candidates = (
+        service._candidate_pool(test_chain, test_chain.model_copy(update={"expiry": "16-Jun-2026"}))[:5]
+        + service._high_risk_pool(test_chain)[:2]
+    )
     report = GeminiRecommendation(
         ideas=[
-            idea(first.id, 1),
-            idea(same_family.id, 2),
-            idea(None, 3),
-            idea(None, 4),
-            idea(None, 5),
+            GeminiIdea(
+                candidate_id=candidate.id,
+                thesis=(
+                    f"The setup has a clear edge in the current market regime. "
+                    f"It remains useful while the original thesis holds for this structure."
+                ),
+                entry="Enter the complete package only when the quoted spread remains orderly.",
+                risk_exit="Exit when price behavior no longer supports the intended payoff.",
+            )
+            for candidate in candidates
         ]
     )
-    errors = service._validate_gemini(report, candidates, [], [], [])
+    errors = service._validate_concise(report, candidates, evidence(test_chain))
+    assert not any("global" in error.lower() for error in errors)
+
+
+def test_concise_validation_rejects_numbers_and_unknown_references(monkeypatch):
+    service, test_chain = setup_service(monkeypatch)
+    candidates = (
+        service._candidate_pool(test_chain, test_chain.model_copy(update={"expiry": "16-Jun-2026"}))[:5]
+        + service._high_risk_pool(test_chain)[:2]
+    )
+    report = GeminiRecommendation(
+        ideas=[
+            GeminiIdea(
+                candidate_id=candidate.id,
+                thesis=(
+                    "The setup looks constructive with RSI at 55. "
+                    "It remains useful while the original thesis holds."
+                ),
+                entry="Enter the complete package when execution remains orderly.",
+                risk_exit="Exit when price behavior no longer supports the payoff.",
+                headline_ids=["missing-news"] if index == 0 else [],
+            )
+            for index, candidate in enumerate(candidates)
+        ]
+    )
+    errors = service._validate_concise(report, candidates, evidence(test_chain))
+    assert any("raw numeric data" in error for error in errors)
     assert any("unknown headline" in error for error in errors)
-    assert any("family is repeated" in error for error in errors)
 
 
-def test_server_controls_confidence():
+def test_narrative_cache_reuses_completed_response(monkeypatch):
+    service, _ = setup_service(monkeypatch)
+    monkeypatch.setattr("app.recommendations.settings", SimpleNamespace(gemini_api_key=None))
+    preview = service.preview(
+        RecommendationRequest(
+            expiry="09-Jun-2026",
+            far_expiry="16-Jun-2026",
+            analysis_date="2026-06-07",
+        )
+    )
+    first = service.narrative(
+        RecommendationNarrativeRequest(analysis_id=preview.analysis_id), "127.0.0.1"
+    )
+    monkeypatch.setattr(
+        service,
+        "_cached_evidence",
+        lambda *_: (_ for _ in ()).throw(AssertionError("cache miss")),
+    )
+    second = service.narrative(
+        RecommendationNarrativeRequest(analysis_id=preview.analysis_id), "127.0.0.1"
+    )
+    assert second == first
+
+
+def test_expired_preview_returns_lookup_error():
+    service = RecommendationService()
+    with pytest.raises(LookupError, match="expired"):
+        service.narrative(
+            RecommendationNarrativeRequest(analysis_id="missing"), "127.0.0.1"
+        )
+
+
+def test_prompt_version_invalidates_old_cache_contract():
+    assert PROMPT_VERSION == "desk-v5-concise"
+
+
+def test_trade_validity_guard_rejects_weak_defined_payoff():
     service = RecommendationService()
     candidate = service._candidate_pool(chain(), None)[0].model_copy(
-        update={"score": 95, "liquidity_score": 95, "outlook": "Bullish"}
+        update={"max_profit": 400, "max_loss": 1000, "metric_mode": "fixed"}
     )
-    confidence, _ = service._confidence(
-        candidate,
-        TechnicalIndicators(ema_9=23500, ema_21=23300, rsi_14=60),
-    )
-    assert confidence == "high"
+    valid, reason, ratio = service._validity(candidate)
+    assert not valid
+    assert "best-case profit" in reason
+    assert ratio == 0.4
 
 
-def test_call_and_put_time_spreads_share_one_strategy_family():
+def test_high_risk_pool_requires_three_to_one_defined_reward():
     service = RecommendationService()
-    candidates = service._candidate_pool(
-        chain(), chain("16-Jun-2026", premium_shift=40)
-    )
-    time_spreads = [
-        candidate
-        for candidate in candidates
-        if "Calendar" in candidate.strategy or "Diagonal" in candidate.strategy
-    ]
-    assert {service._family(item) for item in time_spreads} <= {"calendar", "diagonal"}
+    candidates = service._high_risk_pool(chain())
+    assert len(candidates) >= 2
+    for candidate in candidates:
+        valid, _, ratio = service._validity(candidate)
+        assert valid
+        assert ratio is not None and ratio >= 3

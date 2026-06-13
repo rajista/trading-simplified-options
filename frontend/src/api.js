@@ -4,7 +4,11 @@ async function request(path, options = {}) {
     ...options,
   });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.detail || "Request failed");
+  if (!response.ok) {
+    const error = new Error(body.detail || "Request failed");
+    error.status = response.status;
+    throw error;
+  }
   return body;
 }
 
@@ -20,6 +24,16 @@ export const api = {
     request("/api/recommendations", {
       method: "POST",
       body: JSON.stringify(payload),
+    }),
+  recommendationPreview: (payload) =>
+    request("/api/recommendations/preview", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  recommendationNarrative: (analysisId) =>
+    request("/api/recommendations/narrative", {
+      method: "POST",
+      body: JSON.stringify({ analysis_id: analysisId }),
     }),
   strategy: (type, expiry, farExpiry) => {
     const params = new URLSearchParams({ expiry });

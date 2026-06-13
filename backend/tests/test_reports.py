@@ -44,6 +44,10 @@ def test_missing_gemini_key_returns_rules_report(monkeypatch):
     assert candidate.strategy in report.title
     assert report.short_term_trend == "Unavailable"
     assert report.confidence == "low"
+    assert report.desk_analysis is not None
+    assert len(report.desk_analysis.monitoring_checklist) == 5
+    assert report.desk_analysis.entry_execution_plan
+    assert report.fallback_reason == "The AI provider API key is not configured."
 
 
 def test_gemini_failure_falls_back_to_rules(monkeypatch):
@@ -57,7 +61,7 @@ def test_gemini_failure_falls_back_to_rules(monkeypatch):
     monkeypatch.setattr(
         service,
         "_gemini_report",
-        lambda request: (_ for _ in ()).throw(ValueError("bad output")),
+        lambda request, evidence: (_ for _ in ()).throw(ValueError("bad output")),
     )
     candidate = scan_debit_spreads(chain(), limit=1)[0]
     report = service.generate(
@@ -69,6 +73,7 @@ def test_gemini_failure_falls_back_to_rules(monkeypatch):
         "127.0.0.2",
     )
     assert report.generated_by == "rules"
+    assert report.validation_status == "rules-fallback"
 
 
 def test_rules_report_uses_only_supplied_market_context(monkeypatch):
@@ -98,7 +103,8 @@ def test_rules_report_uses_only_supplied_market_context(monkeypatch):
         "127.0.0.3",
     )
     assert report.short_term_trend == "Bullish"
-    assert report.global_macro_context == ["Verified macro note"]
+    assert "Verified macro note" in report.global_macro_context
     assert report.upcoming_events == ["10-Jun-2026: Verified event"]
-    assert report.sources == ["Test source"]
+    assert "Test source" in report.sources
     assert report.confidence == "medium"
+    assert report.desk_analysis.monitoring_checklist

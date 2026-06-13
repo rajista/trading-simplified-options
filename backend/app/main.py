@@ -18,6 +18,8 @@ from .models import (
     OptionChain,
     PortfolioStrategyRequest,
     RecommendationRequest,
+    RecommendationNarrativeRequest,
+    RecommendationNarrativeResponse,
     RecommendationResponse,
     ReportRequest,
     StrategyResponse,
@@ -85,11 +87,17 @@ async def request_logging(request: Request, call_next):
 def health():
     return {
         "status": "ok",
-        "app_version": "2.2.0",
+        "app_version": "2.4.0",
         "symbol": "NIFTY",
         "lot_size": settings.nifty_lot_size,
         "ai_reports_configured": bool(settings.gemini_api_key),
         "ai_provider": "gemini" if settings.gemini_api_key else "rules",
+        "ai_analysis_mode": settings.gemini_analysis_mode,
+        "ai_model": (
+            settings.gemini_quality_model
+            if settings.gemini_analysis_mode.lower() == "quality"
+            else settings.gemini_fast_model
+        ),
     }
 
 
@@ -254,6 +262,28 @@ def recommendations(request: RecommendationRequest, raw_request: Request):
         raise HTTPException(status_code=429, detail=str(error)) from error
     except MarketDataError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.post("/api/recommendations/preview", response_model=RecommendationResponse)
+def recommendation_preview(request: RecommendationRequest):
+    try:
+        return recommendation_service.preview(request)
+    except MarketDataError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.post(
+    "/api/recommendations/narrative",
+    response_model=RecommendationNarrativeResponse,
+)
+def recommendation_narrative(
+    request: RecommendationNarrativeRequest, raw_request: Request
+):
+    client_ip = raw_request.client.host if raw_request.client else "unknown"
+    try:
+        return recommendation_service.narrative(request, client_ip)
+    except LookupError as error:
+        raise HTTPException(status_code=410, detail=str(error)) from error
 
 
 @app.post("/api/analysis", response_model=AnalysisResponse)

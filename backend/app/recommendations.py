@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import threading
 import time
@@ -17,17 +18,31 @@ from pydantic import BaseModel, Field, ValidationError
 
 from .analysis import AnalysisRequest, analyze_candidate
 from .config import settings
+from .desk_analysis import (
+    PROMPT_VERSION,
+    build_rules_analysis,
+    classify_evidence,
+    risk_label,
+    strategy_family,
+    word_count,
+)
 from .market_context import market_context_service
 from .models import (
     AITradeIdea,
+    DeskAnalysis,
     EvidenceReference,
+    MarketContext,
     MarketEvent,
+    MarketEvidencePacket,
     MarketMove,
     NewsItem,
     OptionChain,
     RecommendationChartPoint,
+    RecommendationNarrativeRequest,
+    RecommendationNarrativeResponse,
     RecommendationRequest,
     RecommendationResponse,
+    RejectedTradeIdea,
     StrategyCandidate,
     TechnicalIndicators,
 )
@@ -78,29 +93,30 @@ NEWS_FEEDS = {
 
 RBI_RSS_URL = "https://rbi.org.in/pressreleases_rss.xml"
 NSE_HOLIDAYS_URL = "https://www.nseindia.com/resources/exchange-communication-holidays/"
+logger = logging.getLogger(__name__)
 
 
 class GeminiIdea(BaseModel):
-    candidate_id: str | None = None
-    title: str
-    outlook: str
-    recommendation: str
-    background: str
-    analysis: str
-    entry_plan: str
-    risk_management: str
+    candidate_id: str
+    thesis: str
+    entry: str
+    risk_exit: str
     headline_ids: list[str] = []
     event_ids: list[str] = []
     market_symbols: list[str] = []
 
 
 class GeminiRecommendation(BaseModel):
-    ideas: list[GeminiIdea] = Field(min_length=5, max_length=5)
+    ideas: list[GeminiIdea] = Field(min_length=7, max_length=7)
 
 
 class RecommendationService:
     def __init__(self) -> None:
         self.cache: dict[str, RecommendationResponse] = {}
+        self.preview_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self.narrative_cache: dict[str, RecommendationNarrativeResponse] = {}
+        self.evidence_cache: dict[str, tuple[float, MarketEvidencePacket]] = {}
+        self.scan_cache: dict[str, tuple[list[StrategyCandidate], list[StrategyCandidate]]] = {}
         self.requests: dict[str, list[float]] = {}
         self.lock = threading.Lock()
 
@@ -114,6 +130,20 @@ class RecommendationService:
                 raise ValueError("Daily AI recommendation limit reached for this IP address.")
             history.append(now)
             self.requests[client_ip] = history
+
+    @staticmethod
+    def _provider_error_message(error: httpx.HTTPStatusError) -> str:
+        status = error.response.status_code
+        if status == 429:
+            return "The AI service quota is temporarily exhausted. Showing the rules-based desk analysis instead."
+        if status == 503:
+            return "The AI service is temporarily busy. Showing the rules-based desk analysis instead; retry after a few minutes."
+        if status in {401, 403}:
+            return "The AI service rejected the configured credentials. Showing the rules-based desk analysis instead."
+        return (
+            f"The AI service returned HTTP {status}. "
+            "Showing the rules-based desk analysis instead."
+        )
 
     @staticmethod
     def _history(symbol: str, range_name: str = "1y") -> dict[str, Any]:
@@ -231,7 +261,7 @@ class RecommendationService:
 
     @staticmethod
     def _events(report_date: str) -> list[MarketEvent]:
-        events = parse_manual_events(settings.market_events_json)
+        events = parse_manual_events(getattr(settings, "market_events_json", "[]"))
         try:
             response = httpx.get(RBI_RSS_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
             response.raise_for_status()
@@ -280,43 +310,138 @@ class RecommendationService:
         return diversified
 
     @staticmethod
-    def _family(candidate: StrategyCandidate) -> str:
-        configured = candidate.metadata.get("strategy_family")
-        if configured:
-            return str(configured)
-        name = candidate.strategy.lower()
-        for family, markers in (
-            ("calendar", ("calendar",)),
-            ("diagonal", ("diagonal",)),
-            ("credit", ("credit spread",)),
-            ("debit", ("debit spread",)),
-            ("iron-condor", ("iron condor",)),
-            ("broken-wing-butterfly", ("broken-wing",)),
-            ("butterfly", ("butterfly",)),
-            ("risk-reversal", ("risk reversal",)),
-            ("straddle", ("straddle",)),
-            ("strangle", ("strangle",)),
+    def _effective_profit_loss(
+        candidate: StrategyCandidate,
+    ) -> tuple[float | None, float | None]:
+        if candidate.metric_mode == "modeled":
+            return candidate.estimated_peak_profit, candidate.modeled_worst_loss
+        return candidate.max_profit, candidate.max_loss
+
+    @classmethod
+    def _validity(
+        cls, candidate: StrategyCandidate
+    ) -> tuple[bool, str | None, float | None]:
+        max_profit, max_loss = cls._effective_profit_loss(candidate)
+        if max_profit is None or max_loss is None:
+            return True, None, None
+        ratio = max_profit / max_loss if max_loss > 0 else None
+        if max_profit <= 0 or max_profit <= max_loss * 0.5:
+            return (
+                False,
+                "This structure's best-case profit does not justify its defined risk. AI has skipped this slot.",
+                ratio,
+            )
+        return True, None, ratio
+
+    @classmethod
+    def _high_risk_pool(cls, chain: OptionChain) -> list[StrategyCandidate]:
+        spot = chain.underlying_value
+        pool = (
+            scan_debit_spreads(chain, limit=60)
+            + scan_butterflies(chain, limit=60)
+            + scan_broken_wing_butterflies(chain, limit=60)
+        )
+        selected: list[StrategyCandidate] = []
+        seen: set[str] = set()
+        for candidate in sorted(
+            pool,
+            key=lambda item: (
+                (item.max_profit or 0) / max(item.max_loss or 1, 1),
+                item.score,
+                item.liquidity_score,
+            ),
+            reverse=True,
         ):
-            if any(marker in name for marker in markers):
-                return family
-        return name
+            valid, _, ratio = cls._validity(candidate)
+            max_profit, max_loss = cls._effective_profit_loss(candidate)
+            if (
+                not valid
+                or ratio is None
+                or ratio < 3
+                or ratio > 20
+                or max_loss is None
+                or max_loss < 500
+                or max_profit is None
+                or candidate.id in seen
+            ):
+                continue
+            name = candidate.strategy.lower()
+            if "debit spread" in name:
+                buy_leg = next((leg for leg in candidate.legs if leg.action == "BUY"), None)
+                if not buy_leg:
+                    continue
+                is_otm = (
+                    buy_leg.option_type == "CE" and buy_leg.strike > spot
+                ) or (
+                    buy_leg.option_type == "PE" and buy_leg.strike < spot
+                )
+                if not is_otm:
+                    continue
+            elif "butterfly" not in name:
+                continue
+            selected.append(candidate)
+            seen.add(candidate.id)
+            if len(selected) == 8:
+                break
+        return selected
+
+    @staticmethod
+    def _family(candidate: StrategyCandidate) -> str:
+        return strategy_family(candidate)
 
     @staticmethod
     def _risk_label(candidate: StrategyCandidate) -> str:
-        if candidate.metric_mode == "modeled":
-            value = candidate.modeled_worst_loss
-            return (
-                f"Modeled range loss: Rs {value:,.0f}; not a guaranteed maximum"
-                if value is not None
-                else "Modeled risk unavailable"
+        return risk_label(candidate)
+
+    def collect_evidence(
+        self, chain: OptionChain, report_date: str
+    ) -> MarketEvidencePacket:
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            indicators_future = executor.submit(self._technical_indicators)
+            news_future = executor.submit(self._news)
+            events_future = executor.submit(self._events, report_date)
+            indicators, nifty_prices = indicators_future.result()
+            news = news_future.result()
+            events = events_future.result()
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            markets = list(
+                executor.map(
+                    lambda item: self._market_move(item[0], item[1], nifty_prices),
+                    GLOBAL_SYMBOLS.items(),
+                )
             )
-        if not candidate.metadata.get("bounded_loss", candidate.max_loss is not None):
-            return "Maximum loss: Unlimited"
-        return (
-            f"Exact maximum loss: Rs {candidate.max_loss:,.0f}"
-            if candidate.max_loss is not None
-            else "Exact maximum loss unavailable"
+        summary = calculate_chain_summary(chain)
+        packet = MarketEvidencePacket(
+            report_date=report_date,
+            chain_timestamp=chain.timestamp,
+            technical_indicators=indicators,
+            option_chain_summary=summary,
+            global_markets=markets,
+            news=news,
+            market_events=events,
+            short_term_trend="Unavailable",
+            medium_term_trend="Unavailable",
+            momentum_strength="Unavailable",
+            volatility_regime="Unavailable",
+            iv_premium_regime="Unavailable",
+            option_chain_bias="Unavailable",
+            event_risk="Unavailable",
+            input_timestamps={
+                "option_chain": chain.timestamp,
+                "nifty_indicators": indicators.timestamp,
+                **{item.symbol: item.timestamp for item in markets},
+            },
+            stale_inputs=[
+                label
+                for label, stale in (
+                    ("NIFTY indicators", indicators.stale),
+                    ("option chain", chain.stale),
+                    ("global markets", any(item.stale for item in markets)),
+                )
+                if stale
+            ],
         )
+        return packet.model_copy(update=classify_evidence(packet))
 
     @staticmethod
     def _trend_alignment(candidate: StrategyCandidate, indicators: TechnicalIndicators) -> bool:
@@ -434,6 +559,61 @@ class RecommendationService:
         ]
 
     @classmethod
+    def _idea_from_candidate(
+        cls,
+        candidate: StrategyCandidate,
+        chain: OptionChain,
+        packet: MarketEvidencePacket,
+        indicators: TechnicalIndicators,
+        *,
+        speculative: bool = False,
+    ) -> AITradeIdea:
+        valid, rejection_reason, ratio = cls._validity(candidate)
+        confidence, rationale = cls._confidence(candidate, indicators)
+        desk = build_rules_analysis(candidate, packet) if valid else None
+        high_risk_reason = None
+        if speculative:
+            confidence = "speculative"
+            rationale = (
+                "This setup deliberately trades a lower win-rate for at least "
+                "three units of potential reward per unit of defined risk."
+            )
+            breakevens = candidate.breakevens or candidate.estimated_breakevens
+            boundary = ", ".join(f"{value:,.0f}" for value in breakevens) or "the displayed breakeven"
+            high_risk_reason = (
+                f"The thesis fails if NIFTY does not move through {boundary} inside the expiry window. "
+                f"Time decay can consume the premium quickly, and the full defined loss of "
+                f"{candidate.max_loss or candidate.modeled_worst_loss or 0:,.0f} INR may be realized."
+            )
+        return AITradeIdea(
+            candidate_id=candidate.id,
+            title=f"{candidate.strategy} setup",
+            strategy=candidate.strategy,
+            outlook=candidate.outlook,
+            recommendation=(
+                f"{desk.decision}: {desk.executive_summary}"
+                if desk
+                else "Setup rejected by the server-side reward/risk guard."
+            ),
+            background=desk.price_action_analysis if desk else "",
+            analysis=desk.option_chain_analysis if desk else "",
+            entry_plan=desk.entry_execution_plan if desk else "",
+            risk_management=desk.risk_analysis if desk else "",
+            confidence=confidence,
+            confidence_rationale=rationale,
+            risk_label=cls._risk_label(candidate),
+            candidate=candidate if valid else None,
+            chart_points=cls._chart(candidate, chain) if valid else [],
+            desk_analysis=desk,
+            valid_setup=valid,
+            rejection_reason=rejection_reason,
+            speculative=speculative,
+            high_risk_reason=high_risk_reason,
+            reward_risk_ratio=ratio,
+            generated_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    @classmethod
     def _rules_response(
         cls,
         request: RecommendationRequest,
@@ -443,47 +623,50 @@ class RecommendationService:
         news: list[NewsItem],
         events: list[MarketEvent],
         indicators: TechnicalIndicators,
+        high_risk_candidates: list[StrategyCandidate] | None = None,
+        evidence_packet: MarketEvidencePacket | None = None,
         fallback_reason: str | None = None,
     ) -> RecommendationResponse:
         context = market_context_service.get(force=request.refresh)
         chain_summary = calculate_chain_summary(chain)
+        packet = evidence_packet or MarketEvidencePacket(
+            report_date=request.analysis_date,
+            chain_timestamp=chain.timestamp,
+            technical_indicators=indicators,
+            option_chain_summary=chain_summary,
+            global_markets=global_markets,
+            news=news,
+            market_events=events,
+            short_term_trend=context.short_term_trend,
+            medium_term_trend=context.medium_term_trend,
+            momentum_strength=context.momentum,
+            volatility_regime=context.volatility_regime,
+            iv_premium_regime="Unavailable",
+            option_chain_bias="Unavailable",
+            event_risk="Unavailable",
+        )
         ideas: list[AITradeIdea] = []
+        rejected: list[RejectedTradeIdea] = []
         used_families: set[str] = set()
         for candidate in candidates:
             family = cls._family(candidate)
             if family in used_families or candidate.score < 65 or candidate.liquidity_score < 50:
                 continue
             used_families.add(family)
-            confidence, rationale = cls._confidence(candidate, indicators)
-            ideas.append(
-                AITradeIdea(
-                    candidate_id=candidate.id,
-                    title=f"{candidate.strategy} setup",
-                    strategy=candidate.strategy,
-                    outlook=candidate.outlook,
-                    recommendation="Review only if current price remains within the displayed entry assumptions.",
-                    background=(
-                        f"NIFTY is {chain.underlying_value:,.2f}, ATM is "
-                        f"{chain_summary.atm_strike or 0:,.0f}, and the option-implied "
-                        f"move proxy is {chain_summary.expected_move_points or 0:,.0f} points."
-                    ),
-                    analysis=(
-                        f"This candidate scored {candidate.score:.1f}/100 with "
-                        f"{candidate.liquidity_score:.1f}/100 liquidity. "
-                        f"{cls._risk_label(candidate)}."
-                    ),
-                    entry_plan="Enter as a complete limit-order combination when all quoted legs remain liquid.",
-                    risk_management=(
-                        f"Use the supplied breakevens and short strikes as triggers. "
-                        f"{cls._risk_label(candidate)}."
-                    ),
-                    confidence=confidence,
-                    confidence_rationale=rationale,
-                    risk_label=cls._risk_label(candidate),
-                    candidate=candidate,
-                    chart_points=cls._chart(candidate, chain),
+            idea = cls._idea_from_candidate(candidate, chain, packet, indicators)
+            ideas.append(idea)
+            if not idea.valid_setup:
+                max_profit, max_loss = cls._effective_profit_loss(candidate)
+                rejected.append(
+                    RejectedTradeIdea(
+                        candidate_id=candidate.id,
+                        strategy=candidate.strategy,
+                        reason=idea.rejection_reason or "Failed reward/risk validation.",
+                        max_profit=max_profit,
+                        max_loss=max_loss,
+                        reward_risk_ratio=idea.reward_risk_ratio,
+                    )
                 )
-            )
             if len(ideas) == 5:
                 break
         while len(ideas) < 5:
@@ -500,16 +683,14 @@ class RecommendationService:
                     confidence="low",
                     confidence_rationale="No qualified canonical candidate was available.",
                     risk_label="No position risk",
+                    generated_at=datetime.now(timezone.utc).isoformat(),
                 )
             )
-        stale_inputs = [
-            name
-            for name, stale in (
-                ("NIFTY indicators", indicators.stale),
-                ("option chain", chain.stale),
-                ("global markets", any(item.stale for item in global_markets)),
+        high_risk_ideas = [
+            cls._idea_from_candidate(
+                candidate, chain, packet, indicators, speculative=True
             )
-            if stale
+            for candidate in (high_risk_candidates or [])[:2]
         ]
         return RecommendationResponse(
             analysis_date=request.analysis_date,
@@ -523,12 +704,10 @@ class RecommendationService:
             global_markets=global_markets,
             news=news,
             ideas=ideas,
-            input_timestamps={
-                "option_chain": chain.timestamp,
-                "nifty_indicators": indicators.timestamp,
-                **{item.symbol: item.timestamp for item in global_markets},
-            },
-            stale_inputs=stale_inputs,
+            high_risk_ideas=high_risk_ideas,
+            rejected_ideas=rejected,
+            input_timestamps=packet.input_timestamps,
+            stale_inputs=packet.stale_inputs,
             validation_status="rules-fallback",
             fallback_reason=fallback_reason,
             assumptions=[
@@ -546,6 +725,7 @@ class RecommendationService:
         request: RecommendationRequest,
         chain: OptionChain,
         candidates: list[StrategyCandidate],
+        high_risk_candidates: list[StrategyCandidate],
         global_markets: list[MarketMove],
         news: list[NewsItem],
         events: list[MarketEvent],
@@ -553,16 +733,32 @@ class RecommendationService:
     ) -> dict[str, Any]:
         summary = calculate_chain_summary(chain)
         relevant_strikes = {
-            leg.strike for candidate in candidates for leg in candidate.legs
+            leg.strike
+            for candidate in candidates + high_risk_candidates
+            for leg in candidate.legs
         }
+
+        def compact_quote(quote: Any) -> dict[str, Any] | None:
+            if quote is None:
+                return None
+            return {
+                "bid": quote.bid,
+                "ask": quote.ask,
+                "ltp": quote.last_price,
+                "iv": quote.implied_volatility,
+                "oi": quote.open_interest,
+                "oi_change": quote.change_in_oi,
+                "volume": quote.volume,
+            }
+
         quote_context = []
         for row in chain.rows:
             if any(abs(row.strike - strike) <= (summary.strike_interval or 50) for strike in relevant_strikes):
                 quote_context.append(
                     {
                         "strike": row.strike,
-                        "ce": row.ce.model_dump(mode="json") if row.ce else None,
-                        "pe": row.pe.model_dump(mode="json") if row.pe else None,
+                        "ce": compact_quote(row.ce),
+                        "pe": compact_quote(row.pe),
                     }
                 )
         return {
@@ -573,12 +769,54 @@ class RecommendationService:
             "option_chain_summary": summary.model_dump(mode="json"),
             "candidate_pool": [
                 RecommendationService._candidate_payload(candidate, chain)
-                for candidate in candidates[:15]
+                for candidate in candidates[:10]
             ],
-            "relevant_option_quotes": quote_context[:80],
+            "high_risk_candidate_pool": [
+                RecommendationService._candidate_payload(candidate, chain)
+                for candidate in high_risk_candidates[:4]
+            ],
+            "relevant_option_quotes": quote_context[:40],
             "global_markets": [item.model_dump(mode="json") for item in global_markets],
-            "headlines": [item.model_dump(mode="json") for item in news],
-            "nearby_events": [item.model_dump(mode="json") for item in events],
+            "headlines": [
+                {
+                    "id": item.id,
+                    "title": item.title,
+                    "source": item.source,
+                    "published": item.published,
+                }
+                for item in news
+            ],
+            "nearby_events": [
+                {
+                    "id": item.id,
+                    "date": item.date,
+                    "title": item.title,
+                    "importance": item.importance,
+                    "source": item.source,
+                    "verified": item.verified,
+                }
+                for item in events
+            ],
+            "deterministic_classifications": (
+                classify_evidence(
+                    MarketEvidencePacket(
+                        report_date=request.analysis_date,
+                        chain_timestamp=chain.timestamp,
+                        technical_indicators=indicators,
+                        option_chain_summary=summary,
+                        global_markets=global_markets,
+                        news=news,
+                        market_events=events,
+                        short_term_trend="Unavailable",
+                        medium_term_trend="Unavailable",
+                        momentum_strength="Unavailable",
+                        volatility_regime="Unavailable",
+                        iv_premium_regime="Unavailable",
+                        option_chain_bias="Unavailable",
+                        event_risk="Unavailable",
+                    )
+                )
+            ),
         }
 
     @staticmethod
@@ -595,10 +833,12 @@ You are an expert NIFTY options educator writing a structured market-desk report
 for report_date {payload["report_date"]}. The report date is a label; all supplied
 market data is current/latest and carries its own timestamp.
 
-Generate exactly five output slots. Use a supplied candidate_id for every trade.
-Trade ideas must use distinct strategy_family values and span at least three
-families when three qualified families exist. If evidence or candidate quality is
-insufficient, use candidate_id null and title "No Trade / Wait".
+Generate exactly seven output slots. Ideas 1-5 are standard ideas and must use
+distinct strategy_family values spanning at least three families when possible.
+Ideas 6-7 must use different candidates from high_risk_candidate_pool, set
+speculative=true, and include a plain-language high_risk_reason. If standard
+evidence is insufficient, use an empty candidate_id and title "No Trade / Wait".
+For standard ideas, use an empty high_risk_reason.
 
 For each trade:
 - background: 3-4 substantive sentences. Explain NIFTY versus ATM, support,
@@ -614,6 +854,14 @@ For each trade:
   short strikes, breakevens, support/resistance or ATR.
 - recommendation: a concise educational action conditional on live confirmation.
 - headline_ids, event_ids and market_symbols: include only IDs/symbols supplied.
+- Keep every narrative field concise and focused on the trade consequence.
+- Every subsection must be inference-led. Lead with the takeaway, cite the
+  number as evidence second, then explain the trade consequence. A sentence
+  that lists a metric without explaining how it changes entry, sizing,
+  adjustment, invalidation or exit is unacceptable.
+- Ideas 6-7 deliberately sacrifice win-rate for a large payoff if the
+  directional thesis plays out inside the expiry window. Do not alter their
+  canonical legs or server-calculated reward/risk.
 
 Do not calculate risk, invent a price, event, headline, source, correlation or
 market relationship. Do not repeat background or entry-plan prose. Return only
@@ -624,11 +872,79 @@ DATA:
 """.strip()
 
     @staticmethod
+    def _gemini_response_schema() -> dict[str, Any]:
+        string = {"type": "string"}
+        string_list = {"type": "array", "items": string}
+        desk_properties = {
+            "decision": {"type": "string", "enum": ["Consider", "Wait", "Avoid"]},
+            "executive_summary": string,
+            "price_action_analysis": string,
+            "option_chain_analysis": string,
+            "global_cues": string_list,
+            "news_event_risk": string,
+            "score_liquidity_analysis": string,
+            "strategy_rationale": string,
+            "entry_execution_plan": string,
+            "risk_analysis": string,
+            "adjustment_exit_plan": string,
+            "monitoring_checklist": string_list,
+            "supporting_evidence": string_list,
+            "conflicting_evidence": string_list,
+            "word_count": {"type": "integer"},
+        }
+        desk_schema = {
+            "type": "object",
+            "properties": desk_properties,
+            "required": list(desk_properties),
+        }
+        idea_properties = {
+            "candidate_id": string,
+            "title": string,
+            "outlook": string,
+            "recommendation": string,
+            "background": string,
+            "analysis": string,
+            "entry_plan": string,
+            "risk_management": string,
+            "headline_ids": string_list,
+            "event_ids": string_list,
+            "market_symbols": string_list,
+            "desk_analysis": desk_schema,
+            "speculative": {"type": "boolean"},
+            "high_risk_reason": string,
+        }
+        return {
+            "type": "object",
+            "properties": {
+                "ideas": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": idea_properties,
+                        "required": list(idea_properties),
+                    },
+                }
+            },
+            "required": ["ideas"],
+        }
+
+    @staticmethod
     def _call_gemini(prompt: str) -> GeminiRecommendation:
+        model = (
+            getattr(settings, "gemini_quality_model", "gemini-2.5-flash")
+            if getattr(settings, "gemini_analysis_mode", "quality").lower() == "quality"
+            else getattr(settings, "gemini_fast_model", "gemini-2.5-flash-lite")
+        )
+        generation_config = {
+            "responseMimeType": "application/json",
+            "responseJsonSchema": RecommendationService._gemini_response_schema(),
+            "maxOutputTokens": 3072,
+            "temperature": 0.75,
+        }
         response = httpx.post(
             (
                 "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{settings.gemini_model}:generateContent"
+                f"{model}:generateContent"
             ),
             headers={
                 "x-goog-api-key": settings.gemini_api_key or "",
@@ -636,13 +952,9 @@ DATA:
             },
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "responseMimeType": "application/json",
-                    "responseJsonSchema": GeminiRecommendation.model_json_schema(),
-                    "temperature": 0.2,
-                },
+                "generationConfig": generation_config,
             },
-            timeout=60,
+            timeout=settings.gemini_timeout_seconds,
         )
         response.raise_for_status()
         text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
@@ -667,12 +979,22 @@ DATA:
         backgrounds: list[str] = []
         entries: list[str] = []
         for index, idea in enumerate(report.ideas, 1):
+            candidate = None
             if idea.candidate_id:
                 candidate = candidate_lookup.get(idea.candidate_id)
                 if not candidate:
                     errors.append(f"Idea {index} uses unknown candidate_id {idea.candidate_id}.")
-                else:
+                elif index <= 5:
                     families.append(cls._family(candidate))
+            if index > 5:
+                if not idea.speculative:
+                    errors.append(f"Idea {index} must be marked speculative.")
+                if not idea.high_risk_reason:
+                    errors.append(f"Idea {index} needs a high-risk failure explanation.")
+                if candidate:
+                    _, _, ratio = cls._validity(candidate)
+                    if ratio is None or ratio < 3:
+                        errors.append(f"Idea {index} does not meet the 3:1 reward/risk floor.")
             if set(idea.headline_ids) - news_ids:
                 errors.append(f"Idea {index} cites an unknown headline ID.")
             if set(idea.event_ids) - event_ids:
@@ -688,12 +1010,16 @@ DATA:
                         idea.entry_plan,
                         idea.risk_management,
                         idea.recommendation,
+                        json.dumps(idea.desk_analysis.model_dump(mode="json")),
                     )
                 ),
                 re.I,
             ):
-                value = float(raw_number.replace(",", ""))
-                if allowed_numbers and not any(abs(value - known) <= 0.11 for known in allowed_numbers):
+                normalized_number = raw_number.replace(",", "")
+                if not normalized_number or not any(char.isdigit() for char in normalized_number):
+                    continue
+                value = float(normalized_number)
+                if allowed_numbers and not any(abs(value - known) <= 1.01 for known in allowed_numbers):
                     errors.append(f"Idea {index} introduces unknown monetary value {value}.")
             backgrounds.append(re.sub(r"\W+", " ", idea.background.lower()).strip())
             entries.append(re.sub(r"\W+", " ", idea.entry_plan.lower()).strip())
@@ -702,11 +1028,95 @@ DATA:
         available_families = {cls._family(item) for item in candidates}
         if len(available_families) >= 3 and len(set(families)) < 3:
             errors.append("Fewer than three strategy families were used.")
+        if len(report.ideas) != 7:
+            errors.append("Exactly seven ideas are required.")
         if len(backgrounds) != len(set(backgrounds)):
             errors.append("Background prose is duplicated.")
         if len(entries) != len(set(entries)):
             errors.append("Entry-plan prose is duplicated.")
         return errors
+
+    @staticmethod
+    def _sanitize_monetary_text(text: str, allowed_numbers: set[float]) -> str:
+        def replace(match: re.Match[str]) -> str:
+            currency, raw_number = match.groups()
+            normalized = raw_number.replace(",", "")
+            if not normalized or not any(char.isdigit() for char in normalized):
+                return match.group(0)
+            value = float(normalized)
+            if any(abs(value - known) <= 1.01 for known in allowed_numbers):
+                return match.group(0)
+            return f"{currency} server-calculated amount"
+
+        return re.sub(
+            r"(Rs\.?|INR|\u20b9)\s*([\d,]+(?:\.\d+)?)",
+            replace,
+            text,
+            flags=re.I,
+        )
+
+    @classmethod
+    def _ground_gemini_output(
+        cls,
+        report: GeminiRecommendation,
+        candidates: list[StrategyCandidate],
+        evidence: MarketEvidencePacket,
+        allowed_numbers: set[float],
+    ) -> GeminiRecommendation:
+        candidate_lookup = {item.id: item for item in candidates}
+        grounded_ideas = []
+        for idea in report.ideas:
+            data = idea.model_dump(mode="python")
+
+            def sanitize(value: Any) -> Any:
+                if isinstance(value, str):
+                    return cls._sanitize_monetary_text(value, allowed_numbers)
+                if isinstance(value, list):
+                    return [sanitize(item) for item in value]
+                if isinstance(value, dict):
+                    return {key: sanitize(item) for key, item in value.items()}
+                return value
+
+            idea = GeminiIdea.model_validate(sanitize(data))
+            candidate = candidate_lookup.get(idea.candidate_id or "")
+            if not candidate:
+                grounded_ideas.append(idea)
+                continue
+            desk = idea.desk_analysis
+            if f"{candidate.score:.1f}" not in (
+                desk.score_liquidity_analysis + desk.executive_summary
+            ):
+                desk = desk.model_copy(
+                    update={
+                        "score_liquidity_analysis": (
+                            f"The server-calculated scanner score is {candidate.score:.1f}/100 "
+                            f"and liquidity is {candidate.liquidity_score:.1f}/100. "
+                            + desk.score_liquidity_analysis
+                        )
+                    }
+                )
+            baseline = build_rules_analysis(candidate, evidence)
+            supplements = (
+                ("option_chain_analysis", baseline.option_chain_analysis),
+                ("price_action_analysis", baseline.price_action_analysis),
+                ("strategy_rationale", baseline.strategy_rationale),
+                ("adjustment_exit_plan", baseline.adjustment_exit_plan),
+                ("score_liquidity_analysis", baseline.score_liquidity_analysis),
+            )
+            for field, supplement in supplements:
+                if word_count(desk) >= 600:
+                    break
+                desk = desk.model_copy(
+                    update={
+                        field: (
+                            getattr(desk, field)
+                            + "\n\nServer-grounded evidence supplement: "
+                            + supplement
+                        )
+                    }
+                )
+            grounded_ideas.append(idea.model_copy(update={"desk_analysis": desk}))
+        return report.model_copy(update={"ideas": grounded_ideas})
 
     @staticmethod
     def _numeric_facts(payload: Any) -> set[float]:
@@ -728,132 +1138,640 @@ DATA:
         request: RecommendationRequest,
         chain: OptionChain,
         candidates: list[StrategyCandidate],
+        high_risk_candidates: list[StrategyCandidate],
         global_markets: list[MarketMove],
         news: list[NewsItem],
         events: list[MarketEvent],
         indicators: TechnicalIndicators,
+        evidence_packet: MarketEvidencePacket,
     ) -> RecommendationResponse:
         base = cls._rules_response(
-            request, chain, candidates, global_markets, news, events, indicators
+            request,
+            chain,
+            candidates,
+            global_markets,
+            news,
+            events,
+            indicators,
+            high_risk_candidates,
+            evidence_packet,
         )
-        lookup = {item.id: item for item in candidates}
+        all_candidates = candidates + high_risk_candidates
+        lookup = {item.id: item for item in all_candidates}
         ideas: list[AITradeIdea] = []
-        for item in report.ideas:
+        high_risk_ideas: list[AITradeIdea] = []
+        for index, item in enumerate(report.ideas):
             candidate = lookup.get(item.candidate_id or "")
             if candidate:
+                valid, rejection_reason, ratio = cls._validity(candidate)
                 confidence, rationale = cls._confidence(candidate, indicators)
+                if index >= 5:
+                    confidence = "speculative"
+                    rationale = (
+                        "This idea intentionally accepts a lower win-rate for "
+                        "asymmetric reward of at least 3:1."
+                    )
                 strategy = candidate.strategy
                 risk_label = cls._risk_label(candidate)
-                chart = cls._chart(candidate, chain)
+                chart = cls._chart(candidate, chain) if valid else []
             else:
+                valid, rejection_reason, ratio = True, None, None
                 confidence, rationale = "low", "No canonical candidate was attached."
                 strategy, risk_label, chart = "No trade", "No position risk", []
-            ideas.append(
-                AITradeIdea(
-                    **item.model_dump(exclude={"headline_ids", "event_ids", "market_symbols"}),
+            idea = AITradeIdea(
+                    **item.model_dump(
+                        exclude={
+                            "headline_ids",
+                            "event_ids",
+                            "market_symbols",
+                            "desk_analysis",
+                            "speculative",
+                            "high_risk_reason",
+                        }
+                    ),
                     strategy=strategy,
                     confidence=confidence,
                     confidence_rationale=rationale,
                     risk_label=risk_label,
                     evidence=cls._evidence(item, news, events, global_markets),
-                    candidate=candidate,
+                    candidate=candidate if valid else None,
                     chart_points=chart,
+                    desk_analysis=item.desk_analysis.model_copy(
+                        update={"word_count": word_count(item.desk_analysis)}
+                    ) if valid else None,
+                    valid_setup=valid,
+                    rejection_reason=rejection_reason,
+                    speculative=index >= 5,
+                    high_risk_reason=item.high_risk_reason if index >= 5 else None,
+                    reward_risk_ratio=ratio,
+                    generated_at=datetime.now(timezone.utc).isoformat(),
+                )
+            if index < 5:
+                ideas.append(idea)
+            else:
+                high_risk_ideas.append(idea)
+        rejected = []
+        for candidate in candidates:
+            valid, reason, ratio = cls._validity(candidate)
+            if valid:
+                continue
+            max_profit, max_loss = cls._effective_profit_loss(candidate)
+            rejected.append(
+                RejectedTradeIdea(
+                    candidate_id=candidate.id,
+                    strategy=candidate.strategy,
+                    reason=reason or "Failed reward/risk validation.",
+                    max_profit=max_profit,
+                    max_loss=max_loss,
+                    reward_risk_ratio=ratio,
                 )
             )
         return base.model_copy(
             update={
                 "generated_by": "gemini",
                 "ideas": ideas,
-                "validation_status": "passed",
+                "high_risk_ideas": high_risk_ideas,
+                "rejected_ideas": rejected,
+                "validation_status": "passed-server-grounded",
                 "fallback_reason": None,
             }
         )
 
-    def generate(self, request: RecommendationRequest, client_ip: str) -> RecommendationResponse:
-        key = hashlib.sha256(request.model_dump_json().encode()).hexdigest()
-        if not request.refresh and key in self.cache:
-            return self.cache[key]
-        chain = provider.get_chain(request.expiry, force=request.refresh)
-        far = (
-            provider.get_chain(request.far_expiry, force=request.refresh)
-            if request.far_expiry and request.far_expiry != request.expiry
-            else None
+    @staticmethod
+    def _concise_schema() -> dict[str, Any]:
+        string = {"type": "string"}
+        return {
+            "type": "object",
+            "properties": {
+                "ideas": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "candidate_id": string,
+                            "thesis": string,
+                            "entry": string,
+                            "risk_exit": string,
+                            "headline_ids": {"type": "array", "items": string},
+                            "event_ids": {"type": "array", "items": string},
+                            "market_symbols": {"type": "array", "items": string},
+                        },
+                        "required": [
+                            "candidate_id",
+                            "thesis",
+                            "entry",
+                            "risk_exit",
+                            "headline_ids",
+                            "event_ids",
+                            "market_symbols",
+                        ],
+                    },
+                }
+            },
+            "required": ["ideas"],
+        }
+
+    @staticmethod
+    def _concise_prompt(
+        packet: MarketEvidencePacket,
+        candidates: list[StrategyCandidate],
+    ) -> str:
+        def clean_title(value: str) -> str:
+            return re.sub(r"\d+(?:[.,]\d+)*", "", value).strip()
+
+        def market_direction(item: MarketMove) -> str:
+            move = item.one_day_return
+            return "unavailable" if move is None else "positive" if move > 0 else "negative" if move < 0 else "flat"
+
+        def correlation_strength(item: MarketMove) -> str:
+            value = max(
+                abs(item.correlation_20d or 0),
+                abs(item.correlation_60d or 0),
+            )
+            return "strong" if value >= 0.6 else "moderate" if value >= 0.3 else "weak"
+
+        payload = {
+            "classifications": {
+                "short_term_trend": packet.short_term_trend,
+                "medium_term_trend": packet.medium_term_trend,
+                "momentum": packet.momentum_strength,
+                "volatility": packet.volatility_regime,
+                "iv_regime": packet.iv_premium_regime,
+                "chain_bias": packet.option_chain_bias,
+                "event_risk": packet.event_risk,
+            },
+            "candidates": [
+                {
+                    "candidate_id": item.id,
+                    "strategy": item.strategy,
+                    "family": strategy_family(item),
+                    "outlook": item.outlook,
+                    "premium_style": (
+                        "debit"
+                        if item.net_debit is not None
+                        else "credit"
+                        if item.net_credit is not None
+                        else "mixed"
+                    ),
+                    "risk_type": (
+                        "modeled"
+                        if item.metric_mode == "modeled"
+                        else "defined"
+                        if item.metadata.get("bounded_loss", item.max_loss is not None)
+                        else "unlimited"
+                    ),
+                }
+                for item in candidates
+            ],
+            "global_markets": [
+                {
+                    "symbol": item.symbol,
+                    "name": item.name,
+                    "direction": market_direction(item),
+                    "nifty_correlation": correlation_strength(item),
+                }
+                for item in packet.global_markets
+                if not item.stale
+            ],
+            "headlines": [
+                {"id": item.id, "title": clean_title(item.title), "source": item.source}
+                for item in packet.news
+            ],
+            "events": [
+                {
+                    "id": item.id,
+                    "title": clean_title(item.title),
+                    "importance": item.importance,
+                }
+                for item in packet.market_events
+            ],
+        }
+        return f"""
+You are a concise options trader writing a quick internal note for a colleague.
+
+Write exactly one note for each supplied candidate, in the same order.
+The server decides confidence and Consider/Wait/Avoid; do not calculate them.
+
+Each note must contain:
+- candidate_id copied exactly.
+- thesis: two or three natural sentences explaining the inference and trade consequence.
+- entry: one practical, strategy-specific sentence.
+- risk_exit: one practical invalidation or exit sentence.
+- optional supplied headline_ids, event_ids and market_symbols when genuinely relevant.
+
+Do not put any number, price, percentage, score, timestamp, currency amount or strike
+in thesis, entry or risk_exit. Do not recite indicators. Do not force a global-market
+reference. Avoid formal report language, generic warnings and repeated sentence patterns.
+NIFTY options are cash-settled, so never mention assignment or physical delivery.
+
+Tone examples:
+- "Volatility has compressed enough that selling premium has a real edge here, and the positioning is not fighting the direction. Main risk is the nearby event could gap it past the short strike before you can adjust."
+- "The setup works while the market stays orderly, but the nearby event creates a real gap risk."
+- "Momentum is fading rather than reversing, so this is better treated as a controlled range trade than a directional bet."
+
+Return only schema-valid JSON.
+
+DATA:
+{json.dumps(payload, separators=(",", ":"))}
+""".strip()
+
+    @staticmethod
+    def _call_concise_gemini(prompt: str) -> GeminiRecommendation:
+        model = getattr(settings, "gemini_fast_model", "gemini-2.5-flash-lite")
+        response = httpx.post(
+            (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent"
+            ),
+            headers={
+                "x-goog-api-key": settings.gemini_api_key or "",
+                "Content-Type": "application/json",
+            },
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "responseJsonSchema": RecommendationService._concise_schema(),
+                    "maxOutputTokens": 3072,
+                    "temperature": 0.75,
+                },
+            },
+            timeout=settings.gemini_timeout_seconds,
         )
-        indicators, nifty_prices = self._technical_indicators()
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            global_markets = list(
-                executor.map(
-                    lambda item: self._market_move(item[0], item[1], nifty_prices),
-                    GLOBAL_SYMBOLS.items(),
+        response.raise_for_status()
+        text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return GeminiRecommendation.model_validate_json(text)
+
+    @staticmethod
+    def _sentence_count(text: str) -> int:
+        return len([item for item in re.split(r"(?<=[.!?])\s+", text.strip()) if item])
+
+    @classmethod
+    def _validate_concise(
+        cls,
+        report: GeminiRecommendation,
+        candidates: list[StrategyCandidate],
+        packet: MarketEvidencePacket,
+    ) -> list[str]:
+        errors: list[str] = []
+        expected = [item.id for item in candidates]
+        actual = [item.candidate_id for item in report.ideas]
+        if actual != expected:
+            errors.append("Candidate IDs or order do not match the preview.")
+        news_ids = {item.id for item in packet.news}
+        event_ids = {item.id for item in packet.market_events}
+        symbols = {item.symbol for item in packet.global_markets}
+        prose_seen: set[str] = set()
+        forbidden = re.compile(r"\d|₹|%|\b(?:INR|Rs\.?)\b", re.I)
+        formal = re.compile(
+            r"\b(?:executive summary|market-desk report|as an ai|provided data indicates|assignment|physical delivery)\b",
+            re.I,
+        )
+        for index, idea in enumerate(report.ideas, 1):
+            if cls._sentence_count(idea.thesis) not in {2, 3}:
+                errors.append(f"Idea {index} thesis must contain two or three sentences.")
+            if cls._sentence_count(idea.entry) != 1:
+                errors.append(f"Idea {index} entry must contain one sentence.")
+            if cls._sentence_count(idea.risk_exit) != 1:
+                errors.append(f"Idea {index} risk exit must contain one sentence.")
+            prose = " ".join((idea.thesis, idea.entry, idea.risk_exit))
+            if forbidden.search(prose):
+                errors.append(f"Idea {index} includes raw numeric data.")
+            if formal.search(prose):
+                errors.append(f"Idea {index} uses formal or generic report language.")
+            normalized = re.sub(r"\W+", " ", idea.thesis.lower()).strip()
+            if normalized in prose_seen:
+                errors.append(f"Idea {index} duplicates another thesis.")
+            prose_seen.add(normalized)
+            if set(idea.headline_ids) - news_ids:
+                errors.append(f"Idea {index} cites an unknown headline.")
+            if set(idea.event_ids) - event_ids:
+                errors.append(f"Idea {index} cites an unknown event.")
+            if set(idea.market_symbols) - symbols:
+                errors.append(f"Idea {index} cites an unknown market symbol.")
+        return errors
+
+    def _cached_evidence(
+        self, chain: OptionChain, report_date: str
+    ) -> MarketEvidencePacket:
+        key = f"{chain.timestamp}:{report_date}"
+        cached = self.evidence_cache.get(key)
+        if cached and time.time() - cached[0] < 300:
+            return cached[1]
+        packet = self.collect_evidence(chain, report_date)
+        self.evidence_cache[key] = (time.time(), packet)
+        return packet
+
+    @classmethod
+    def _preview_idea(
+        cls,
+        candidate: StrategyCandidate,
+        chain: OptionChain,
+        *,
+        speculative: bool = False,
+    ) -> AITradeIdea:
+        valid, rejection_reason, ratio = cls._validity(candidate)
+        confidence = (
+            "speculative"
+            if speculative
+            else "high"
+            if candidate.score > 90 and candidate.liquidity_score > 90
+            else "medium"
+            if candidate.score > 80
+            else "low"
+        )
+        rationale = (
+            "This is an asymmetric setup intended for experienced traders."
+            if speculative
+            else "Confidence is calculated from scanner quality and executable liquidity."
+        )
+        return AITradeIdea(
+            candidate_id=candidate.id,
+            title=f"{candidate.strategy} setup",
+            strategy=candidate.strategy,
+            outlook=candidate.outlook,
+            recommendation="Writing market view...",
+            background="",
+            analysis="",
+            entry_plan="",
+            risk_management="",
+            confidence=confidence,
+            confidence_rationale=rationale,
+            risk_label=cls._risk_label(candidate),
+            candidate=candidate if valid else None,
+            chart_points=cls._chart(candidate, chain) if valid else [],
+            valid_setup=valid,
+            rejection_reason=rejection_reason,
+            speculative=speculative,
+            high_risk_reason=(
+                "This setup accepts a lower win rate for a larger payoff and can lose its defined risk quickly."
+                if speculative
+                else None
+            ),
+            reward_risk_ratio=ratio,
+            generated_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    def preview(self, request: RecommendationRequest) -> RecommendationResponse:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            near_future = executor.submit(
+                provider.get_chain, request.expiry, request.refresh
+            )
+            far_future = (
+                executor.submit(
+                    provider.get_chain, request.far_expiry, request.refresh
+                )
+                if request.far_expiry and request.far_expiry != request.expiry
+                else None
+            )
+            chain = near_future.result()
+            far = far_future.result() if far_future else None
+        scan_key = f"{chain.timestamp}:{far.timestamp if far else ''}"
+        scan_result = None if request.refresh else self.scan_cache.get(scan_key)
+        if scan_result is None:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                candidates_future = executor.submit(self._candidate_pool, chain, far)
+                high_future = executor.submit(self._high_risk_pool, chain)
+                candidates = candidates_future.result()
+                high_risk = high_future.result()
+            self.scan_cache[scan_key] = (candidates, high_risk)
+        else:
+            candidates, high_risk = scan_result
+        valid_candidates = [item for item in candidates if self._validity(item)[0]]
+        selected: list[StrategyCandidate] = []
+        families: set[str] = set()
+        for candidate in valid_candidates:
+            family = self._family(candidate)
+            if family in families or candidate.score < 65 or candidate.liquidity_score < 50:
+                continue
+            families.add(family)
+            selected.append(candidate)
+            if len(selected) == 5:
+                break
+        ideas = [self._preview_idea(item, chain) for item in selected]
+        while len(ideas) < 5:
+            ideas.append(
+                AITradeIdea(
+                    title="No Trade / Wait",
+                    strategy="No trade",
+                    outlook="Neutral",
+                    recommendation="No additional qualified setup is available.",
+                    background="",
+                    analysis="",
+                    entry_plan="",
+                    risk_management="",
+                    confidence="low",
+                    confidence_rationale="No qualified canonical candidate was available.",
+                    risk_label="No position risk",
                 )
             )
-        news = self._news()
-        events = self._events(request.analysis_date)
-        candidates = self._candidate_pool(chain, far)
-        if settings.gemini_api_key:
+        high_selected = high_risk[:2]
+        high_ideas = [
+            self._preview_idea(item, chain, speculative=True) for item in high_selected
+        ]
+        rejected = []
+        for item in candidates:
+            valid, reason, ratio = self._validity(item)
+            if not valid:
+                profit, loss = self._effective_profit_loss(item)
+                rejected.append(
+                    RejectedTradeIdea(
+                        candidate_id=item.id,
+                        strategy=item.strategy,
+                        reason=reason or "Failed reward/risk validation.",
+                        max_profit=profit,
+                        max_loss=loss,
+                        reward_risk_ratio=ratio,
+                    )
+                )
+        analysis_id = hashlib.sha256(
+            (
+                f"{PROMPT_VERSION}:{request.model_dump_json()}:"
+                f"{chain.timestamp}:{far.timestamp if far else ''}"
+            ).encode()
+        ).hexdigest()[:24]
+        summary = calculate_chain_summary(chain)
+        response = RecommendationResponse(
+            analysis_id=analysis_id,
+            narrative_pending=True,
+            analysis_date=request.analysis_date,
+            generated_by="rules",
+            chain_timestamp=chain.timestamp,
+            underlying_value=chain.underlying_value,
+            market_context=MarketContext(stale=True),
+            technical_indicators=TechnicalIndicators(stale=True),
+            option_chain_summary=summary,
+            market_events=[],
+            global_markets=[],
+            news=[],
+            ideas=ideas,
+            high_risk_ideas=high_ideas,
+            rejected_ideas=rejected,
+            validation_status="preview-ready",
+            assumptions=[
+                "Narrative commentary is generated separately from canonical strategy calculations."
+            ],
+            disclaimer="Verify live prices, liquidity and risk independently before trading.",
+        )
+        self.preview_cache[analysis_id] = (
+            time.time(),
+            {
+                "request": request,
+                "chain": chain,
+                "far": far,
+                "candidates": selected,
+                "high_risk": high_selected,
+                "response": response,
+            },
+        )
+        return response
+
+    @staticmethod
+    def _apply_analysis(
+        idea: AITradeIdea,
+        analysis: DeskAnalysis,
+        evidence: list[EvidenceReference] | None = None,
+    ) -> AITradeIdea:
+        return idea.model_copy(
+            update={
+                "recommendation": analysis.thesis,
+                "background": analysis.thesis,
+                "analysis": analysis.thesis,
+                "entry_plan": analysis.entry,
+                "risk_management": analysis.risk_exit,
+                "desk_analysis": analysis,
+                "evidence": evidence or [],
+            }
+        )
+
+    def narrative(
+        self,
+        request: RecommendationNarrativeRequest,
+        client_ip: str,
+    ) -> RecommendationNarrativeResponse:
+        if request.analysis_id in self.narrative_cache:
+            return self.narrative_cache[request.analysis_id]
+        cached = self.preview_cache.get(request.analysis_id)
+        if not cached or time.time() - cached[0] > 600:
+            raise LookupError("Recommendation preview expired.")
+        state = cached[1]
+        preview: RecommendationResponse = state["response"]
+        chain: OptionChain = state["chain"]
+        candidates: list[StrategyCandidate] = state["candidates"] + state["high_risk"]
+        packet = self._cached_evidence(chain, state["request"].analysis_date)
+        rules = {
+            candidate.id: build_rules_analysis(candidate, packet)
+            for candidate in candidates
+        }
+        generated_by: Literal["gemini", "rules"] = "rules"
+        validation_status = "rules-fallback"
+        fallback_reason: str | None = None
+        gemini_lookup: dict[str, GeminiIdea] = {}
+        if settings.gemini_api_key and len(candidates) == 7:
             try:
                 self._check_limit(client_ip)
-                payload = self._prompt_payload(
-                    request, chain, candidates, global_markets, news, events, indicators
+                report = self._call_concise_gemini(
+                    self._concise_prompt(packet, candidates)
                 )
-                validation_errors: list[str] | None = None
-                for _ in range(2):
-                    gemini = self._call_gemini(self._prompt(payload, validation_errors))
-                    validation_errors = self._validate_gemini(
-                        gemini,
-                        candidates,
-                        news,
-                        events,
-                        global_markets,
-                        self._numeric_facts(payload),
+                errors = self._validate_concise(report, candidates, packet)
+                if errors:
+                    logger.warning("Concise AI validation failed: %s", "; ".join(errors))
+                    fallback_reason = (
+                        "AI commentary was unavailable, so a concise desk view is shown."
                     )
-                    if not validation_errors:
-                        result = self._attach_gemini(
-                            gemini,
-                            request,
-                            chain,
-                            candidates,
-                            global_markets,
-                            news,
-                            events,
-                            indicators,
-                        )
-                        break
                 else:
-                    result = self._rules_response(
-                        request,
-                        chain,
-                        candidates,
-                        global_markets,
-                        news,
-                        events,
-                        indicators,
-                        fallback_reason="Gemini output failed grounding validation after one retry.",
-                    )
-            except (ValueError, httpx.HTTPError, KeyError, TypeError, ValidationError) as error:
-                result = self._rules_response(
-                    request,
-                    chain,
-                    candidates,
-                    global_markets,
-                    news,
-                    events,
-                    indicators,
-                    fallback_reason=f"Gemini unavailable: {type(error).__name__}.",
+                    gemini_lookup = {item.candidate_id: item for item in report.ideas}
+                    generated_by = "gemini"
+                    validation_status = "passed-server-grounded"
+            except (httpx.HTTPError, KeyError, TypeError, ValidationError, ValueError) as error:
+                logger.warning("Concise AI generation failed: %s", error)
+                fallback_reason = (
+                    "AI commentary was unavailable, so a concise desk view is shown."
                 )
         else:
-            result = self._rules_response(
-                request,
-                chain,
-                candidates,
-                global_markets,
-                news,
-                events,
-                indicators,
-                fallback_reason="GEMINI_API_KEY is not configured.",
+            fallback_reason = (
+                "AI commentary was unavailable, so a concise desk view is shown."
             )
-        self.cache[key] = result
+
+        def enrich(idea: AITradeIdea) -> AITradeIdea:
+            if not idea.candidate_id or idea.candidate_id not in rules:
+                return idea
+            base = rules[idea.candidate_id]
+            generated = gemini_lookup.get(idea.candidate_id)
+            if generated:
+                base = base.model_copy(
+                    update={
+                        "thesis": generated.thesis,
+                    }
+                )
+                evidence = self._evidence(
+                    generated, packet.news, packet.market_events, packet.global_markets
+                )
+            else:
+                evidence = []
+            return self._apply_analysis(idea, base, evidence)
+
+        result = RecommendationNarrativeResponse(
+            analysis_id=request.analysis_id,
+            generated_by=generated_by,
+            ideas=[enrich(item) for item in preview.ideas],
+            high_risk_ideas=[enrich(item) for item in preview.high_risk_ideas],
+            market_context=MarketContext(
+                short_term_trend=packet.short_term_trend,
+                medium_term_trend=packet.medium_term_trend,
+                momentum=packet.momentum_strength,
+                volatility_regime=packet.volatility_regime,
+                stale=bool(packet.stale_inputs),
+                data_timestamp=packet.technical_indicators.timestamp,
+            ),
+            technical_indicators=packet.technical_indicators,
+            option_chain_summary=packet.option_chain_summary,
+            market_events=packet.market_events,
+            global_markets=packet.global_markets,
+            news=packet.news,
+            input_timestamps=packet.input_timestamps,
+            stale_inputs=packet.stale_inputs,
+            validation_status=validation_status,
+            fallback_reason=fallback_reason,
+        )
+        self.narrative_cache[request.analysis_id] = result
         return result
+
+    def generate(
+        self, request: RecommendationRequest, client_ip: str
+    ) -> RecommendationResponse:
+        preview = self.preview(request)
+        narrative = self.narrative(
+            RecommendationNarrativeRequest(analysis_id=preview.analysis_id or ""),
+            client_ip,
+        )
+        cached = self.preview_cache[preview.analysis_id or ""][1]
+        packet = self._cached_evidence(cached["chain"], request.analysis_date)
+        return preview.model_copy(
+            update={
+                "narrative_pending": False,
+                "generated_by": narrative.generated_by,
+                "ideas": narrative.ideas,
+                "high_risk_ideas": narrative.high_risk_ideas,
+                "market_context": MarketContext(
+                    short_term_trend=packet.short_term_trend,
+                    medium_term_trend=packet.medium_term_trend,
+                    momentum=packet.momentum_strength,
+                    volatility_regime=packet.volatility_regime,
+                    stale=bool(packet.stale_inputs),
+                    data_timestamp=packet.technical_indicators.timestamp,
+                ),
+                "technical_indicators": packet.technical_indicators,
+                "option_chain_summary": packet.option_chain_summary,
+                "market_events": packet.market_events,
+                "global_markets": packet.global_markets,
+                "news": packet.news,
+                "input_timestamps": packet.input_timestamps,
+                "stale_inputs": packet.stale_inputs,
+                "validation_status": narrative.validation_status,
+                "fallback_reason": narrative.fallback_reason,
+            }
+        )
 
 
 recommendation_service = RecommendationService()

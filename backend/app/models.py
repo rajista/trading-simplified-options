@@ -118,9 +118,39 @@ class ReportRequest(BaseModel):
     candidate: StrategyCandidate
     chain_timestamp: str
     underlying_value: float
+    report_date: str | None = None
+    expiry: str | None = None
+    far_expiry: str | None = None
     assumptions: list[str] = []
     analysis: dict[str, Any] | None = None
     market_context: MarketContext | None = None
+
+
+class DeskAnalysis(BaseModel):
+    decision: Literal["Consider", "Wait", "Avoid"]
+    thesis: str
+    entry: str
+    risk_exit: str
+    supporting_evidence: list[str] = []
+    conflicting_evidence: list[str] = []
+
+
+class DetailedReportAnalysis(BaseModel):
+    decision: Literal["Consider", "Wait", "Avoid"]
+    executive_summary: str
+    price_action_analysis: str
+    option_chain_analysis: str
+    global_cues: list[str]
+    news_event_risk: str
+    score_liquidity_analysis: str
+    strategy_rationale: str
+    entry_execution_plan: str
+    risk_analysis: str
+    adjustment_exit_plan: str
+    monitoring_checklist: list[str]
+    supporting_evidence: list[str]
+    conflicting_evidence: list[str]
+    word_count: int = 0
 
 
 class TradeReport(BaseModel):
@@ -150,6 +180,10 @@ class TradeReport(BaseModel):
     sources: list[str]
     disclaimer: str
     generated_by: Literal["gemini", "rules"]
+    desk_analysis: DetailedReportAnalysis | None = None
+    validation_status: str = "not-run"
+    prompt_version: str = "legacy"
+    fallback_reason: str | None = None
 
 
 class AnalysisRequest(BaseModel):
@@ -282,6 +316,25 @@ class EvidenceReference(BaseModel):
     label: str
 
 
+class MarketEvidencePacket(BaseModel):
+    report_date: str
+    chain_timestamp: str
+    technical_indicators: TechnicalIndicators
+    option_chain_summary: OptionChainSummary
+    global_markets: list[MarketMove]
+    news: list[NewsItem]
+    market_events: list[MarketEvent]
+    short_term_trend: str
+    medium_term_trend: str
+    momentum_strength: str
+    volatility_regime: str
+    iv_premium_regime: str
+    option_chain_bias: str
+    event_risk: str
+    input_timestamps: dict[str, str | None] = {}
+    stale_inputs: list[str] = []
+
+
 class RecommendationChartPoint(BaseModel):
     underlying_price: float
     pnl: float
@@ -296,13 +349,29 @@ class AITradeIdea(BaseModel):
     analysis: str
     entry_plan: str
     risk_management: str
-    confidence: Literal["low", "medium", "high"]
+    confidence: Literal["low", "medium", "high", "speculative"]
     confidence_rationale: str = ""
     candidate_id: str | None = None
     risk_label: str = ""
     evidence: list[EvidenceReference] = []
     candidate: StrategyCandidate | None = None
     chart_points: list[RecommendationChartPoint] = []
+    desk_analysis: DeskAnalysis | None = None
+    valid_setup: bool = True
+    rejection_reason: str | None = None
+    speculative: bool = False
+    high_risk_reason: str | None = None
+    reward_risk_ratio: float | None = None
+    generated_at: str | None = None
+
+
+class RejectedTradeIdea(BaseModel):
+    candidate_id: str
+    strategy: str
+    reason: str
+    max_profit: float | None = None
+    max_loss: float | None = None
+    reward_risk_ratio: float | None = None
 
 
 class RecommendationRequest(BaseModel):
@@ -312,7 +381,30 @@ class RecommendationRequest(BaseModel):
     refresh: bool = False
 
 
+class RecommendationNarrativeRequest(BaseModel):
+    analysis_id: str
+
+
+class RecommendationNarrativeResponse(BaseModel):
+    analysis_id: str
+    generated_by: Literal["gemini", "rules"]
+    ideas: list[AITradeIdea]
+    high_risk_ideas: list[AITradeIdea] = []
+    market_context: MarketContext = MarketContext()
+    technical_indicators: TechnicalIndicators = TechnicalIndicators()
+    option_chain_summary: OptionChainSummary | None = None
+    market_events: list[MarketEvent] = []
+    global_markets: list[MarketMove] = []
+    news: list[NewsItem] = []
+    input_timestamps: dict[str, str | None] = {}
+    stale_inputs: list[str] = []
+    validation_status: str = "not-run"
+    fallback_reason: str | None = None
+
+
 class RecommendationResponse(BaseModel):
+    analysis_id: str | None = None
+    narrative_pending: bool = False
     analysis_date: str
     generated_by: Literal["gemini", "rules"]
     chain_timestamp: str
@@ -324,6 +416,8 @@ class RecommendationResponse(BaseModel):
     global_markets: list[MarketMove]
     news: list[NewsItem]
     ideas: list[AITradeIdea]
+    high_risk_ideas: list[AITradeIdea] = []
+    rejected_ideas: list[RejectedTradeIdea] = []
     input_timestamps: dict[str, str | None] = {}
     stale_inputs: list[str] = []
     validation_status: str = "not-run"

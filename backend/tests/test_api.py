@@ -1,5 +1,12 @@
+import pytest
+from fastapi import HTTPException
+
 from app import main
-from app.models import RecommendationRequest, RecommendationResponse
+from app.models import (
+    RecommendationNarrativeRequest,
+    RecommendationRequest,
+    RecommendationResponse,
+)
 from test_strategies import chain
 
 
@@ -46,3 +53,21 @@ def test_recommendations_endpoint_shape(monkeypatch):
         raw_request=type("Request", (), {"client": type("Client", (), {"host": "test"})()})(),
     )
     assert result.generated_by == "rules"
+
+
+def test_expired_recommendation_preview_returns_410(monkeypatch):
+    monkeypatch.setattr(
+        main.recommendation_service,
+        "narrative",
+        lambda request, client_ip: (_ for _ in ()).throw(LookupError("expired")),
+    )
+    with pytest.raises(HTTPException) as error:
+        main.recommendation_narrative(
+            request=RecommendationNarrativeRequest(analysis_id="expired"),
+            raw_request=type(
+                "Request",
+                (),
+                {"client": type("Client", (), {"host": "test"})()},
+            )(),
+        )
+    assert error.value.status_code == 410
