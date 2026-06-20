@@ -477,8 +477,57 @@ class RecommendationService:
         return "low", "Score, liquidity, or trend alignment does not meet stronger thresholds."
 
     @staticmethod
+    def _expiry_chart_pnl(
+        candidate: StrategyCandidate,
+        price: float,
+        chain: OptionChain,
+    ) -> float:
+        total = 0.0
+        for leg in candidate.legs:
+            intrinsic = (
+                max(0, price - leg.strike)
+                if leg.option_type == "CE"
+                else max(0, leg.strike - price)
+            )
+            direction = 1 if leg.action == "BUY" else -1
+            total += direction * (intrinsic - leg.price) * chain.lot_size * leg.quantity
+        position = candidate.metadata.get("underlying_position")
+        if position:
+            units = float(position.get("units") or 0)
+            current_price = float(position.get("current_price") or 0)
+            cost_basis = float(position.get("average_cost") or current_price)
+            if units > 0 and current_price > 0 and chain.underlying_value:
+                scenario_price = current_price * price / chain.underlying_value
+                total += (scenario_price - cost_basis) * units
+        return round(total, 2)
+
+    @staticmethod
     def _chart(candidate: StrategyCandidate, chain: OptionChain) -> list[RecommendationChartPoint]:
         try:
+            if candidate.metadata.get("payoff_type") == "expiry":
+                lower = chain.underlying_value * 0.92
+                upper = chain.underlying_value * 1.08
+                anchors = {
+                    lower,
+                    upper,
+                    chain.underlying_value,
+                    *(leg.strike for leg in candidate.legs),
+                    *(candidate.breakevens or []),
+                }
+                span = upper - lower
+                grid = {lower + span * index / 80 for index in range(81)}
+                prices = sorted(
+                    price for price in anchors | grid if lower <= price <= upper
+                )
+                return [
+                    RecommendationChartPoint(
+                        underlying_price=round(price, 2),
+                        pnl=RecommendationService._expiry_chart_pnl(
+                            candidate, price, chain
+                        ),
+                    )
+                    for price in prices
+                ]
             analysis = analyze_candidate(
                 AnalysisRequest(
                     candidate=candidate,
@@ -489,14 +538,13 @@ class RecommendationService:
                     price_range_pct=8,
                 )
             )
-            step = max(1, len(analysis.points) // 20)
             return [
                 RecommendationChartPoint(
                     underlying_price=point.underlying_price,
                     pnl=point.evaluation_pnl,
                 )
-                for point in analysis.points[::step]
-            ][:21]
+                for point in analysis.points
+            ]
         except ValueError:
             return []
 

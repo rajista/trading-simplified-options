@@ -362,7 +362,7 @@ function RecommendationMiniChart({ points, spot }) {
           <YAxis tickFormatter={(value) => `₹${number(value, 0)}`} width={70} />
           <Tooltip content={<RecommendationChartTooltip spot={spot} />} />
           <ReferenceLine y={0} stroke="#798092" />
-          <Line type="monotone" dataKey="pnl" name="Scenario P&L" stroke="#0b8a65" strokeWidth={2.5} dot={false} />
+          <Line type="linear" dataKey="pnl" name="Scenario P&L" stroke="#0b8a65" strokeWidth={2.5} dot={false} />
         </ComposedChart>
       </ResponsiveContainer>
     </div>
@@ -428,8 +428,8 @@ function EnhancedRecommendationChart({ points, candidate, spot }) {
           <YAxis tickFormatter={(value) => `₹${number(value, 0)}`} width={70} />
           <Tooltip content={<RecommendationChartTooltip spot={spot} />} />
           <ReferenceLine y={0} stroke="#798092" />
-          <Area type="monotone" dataKey="profit" stroke="none" fill="url(#recommendProfit)" />
-          <Area type="monotone" dataKey="loss" stroke="none" fill="url(#recommendLoss)" />
+          <Area type="linear" dataKey="profit" stroke="none" fill="url(#recommendProfit)" />
+          <Area type="linear" dataKey="loss" stroke="none" fill="url(#recommendLoss)" />
           {breakevens.map((value) => (
             <ReferenceLine key={value} x={value} stroke="#d49b32" strokeDasharray="5 4"
               label={{ value: "BE", position: "top", fill: "#9a6816", fontSize: 9 }} />
@@ -438,7 +438,7 @@ function EnhancedRecommendationChart({ points, candidate, spot }) {
           {simulator && <ReferenceLine x={simulator.underlying_price} stroke="#334155" strokeDasharray="2 2" />}
           <ReferenceDot x={maxPoint.underlying_price} y={maxPoint.pnl} r={5} fill="#d4a33b" stroke="#8a5c0c"
             label={{ value: money(maxPoint.pnl), position: "top", fill: "#8a5c0c", fontSize: 9 }} />
-          <Line type="monotone" dataKey="pnl" name="Scenario P&L" stroke="#078365" strokeWidth={3}
+          <Line type="linear" dataKey="pnl" name="Scenario P&L" stroke="#078365" strokeWidth={3}
             dot={false} activeDot={{ r: 5, fill: "#ffffff", stroke: "#078365", strokeWidth: 3 }} />
         </ComposedChart>
       </ResponsiveContainer>
@@ -1294,12 +1294,12 @@ function AnalysisModal({ candidate, chain, expiry, farExpiry, open, onClose, rep
                     <ReferenceLine key={value} x={value} stroke="#d49b32" strokeDasharray="5 4"
                       label={{ value: "BE", position: "top", fill: "#9a6816", fontSize: 10 }} />
                   ))}
-                  <Area type="monotone" dataKey="profit" name="Profit zone" stroke="none" fill="url(#analysisProfit)" />
-                  <Area type="monotone" dataKey="loss" name="Loss zone" stroke="none" fill="url(#analysisLoss)" />
-                  <Line type="monotone" dataKey="today_pnl" name="Today P&L" stroke="#2b62be" strokeWidth={2.25}
+                  <Area type="linear" dataKey="profit" name="Profit zone" stroke="none" fill="url(#analysisProfit)" />
+                  <Area type="linear" dataKey="loss" name="Loss zone" stroke="none" fill="url(#analysisLoss)" />
+                  <Line type="linear" dataKey="today_pnl" name="Today P&L" stroke="#2b62be" strokeWidth={2.25}
                     strokeDasharray="6 4" dot={false}
                     activeDot={{ r: 4, fill: "#ffffff", stroke: "#2b62be", strokeWidth: 2 }} />
-                  <Line type="monotone" dataKey="evaluation_pnl" name={`${analysis?.evaluation_label || "Evaluation"} P&L`}
+                  <Line type="linear" dataKey="evaluation_pnl" name={`${analysis?.evaluation_label || "Evaluation"} P&L`}
                     stroke="#078365" strokeWidth={3.25} dot={false}
                     activeDot={{ r: 5, fill: "#ffffff", stroke: "#078365", strokeWidth: 3 }} />
                 </ComposedChart>

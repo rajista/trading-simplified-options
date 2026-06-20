@@ -9,6 +9,8 @@ from app.models import (
     OptionChainSummary,
     RecommendationNarrativeRequest,
     RecommendationRequest,
+    StrategyCandidate,
+    StrategyLeg,
     TechnicalIndicators,
 )
 from app.recommendations import GeminiIdea, GeminiRecommendation, RecommendationService
@@ -213,3 +215,42 @@ def test_high_risk_pool_requires_three_to_one_defined_reward():
         valid, _, ratio = service._validity(candidate)
         assert valid
         assert ratio is not None and ratio >= 3
+
+
+def test_fixed_recommendation_chart_preserves_payoff_extrema():
+    test_chain = chain(expiry="23-Jun-2026").model_copy(
+        update={
+            "timestamp": "12-Jun-2026 15:30:00",
+            "underlying_value": 24013.1,
+        }
+    )
+    candidate = StrategyCandidate(
+        id="long-ce-butterfly-regression",
+        strategy="Long CE Butterfly",
+        outlook="Neutral",
+        score=95,
+        liquidity_score=90,
+        legs=[
+            StrategyLeg(action="BUY", option_type="CE", strike=24000, expiry="23-Jun-2026", price=120),
+            StrategyLeg(action="SELL", option_type="CE", strike=24100, expiry="23-Jun-2026", price=72.3, quantity=2),
+            StrategyLeg(action="BUY", option_type="CE", strike=24200, expiry="23-Jun-2026", price=40.4),
+        ],
+        net_debit=1027,
+        max_profit=5473,
+        max_loss=1027,
+        breakevens=[24015.8, 24184.2],
+        return_on_risk=532.91,
+        metadata={
+            "payoff_type": "expiry",
+            "bounded_profit": True,
+            "bounded_loss": True,
+        },
+    )
+
+    points = RecommendationService._chart(candidate, test_chain)
+    values = [point.pnl for point in points]
+    prices = [point.underlying_price for point in points]
+
+    assert 24100 in prices
+    assert max(values) == candidate.max_profit
+    assert abs(min(values)) == candidate.max_loss
